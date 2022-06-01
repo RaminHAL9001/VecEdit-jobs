@@ -30,7 +30,7 @@ import VecEdit.Text.Editor
     newEditTextState, runEditText, pushLine, foldLinesInRange,
   )
 import qualified VecEdit.Table as Table
-import VecEdit.Table (Table, EditTable)
+import VecEdit.Table (Table)
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId)
 import Control.Concurrent.MVar
@@ -459,7 +459,7 @@ processTable = lens theProcessTable $ \ a b -> a{ theProcessTable = b }
 -- | not for export
 --
 -- Performs an arbitray update on any of the 'Table's in the 'ManagerEnv'.
-editManagerEnvTable :: Lens' ManagerEnvState (Table thing) -> EditTable thing a -> Manager a
+editManagerEnvTable :: Lens' ManagerEnvState (Table thing) -> Table.Edit thing a -> Manager a
 editManagerEnvTable table = Manager . lift . Table.withinGroup table
 
 -- | List one of the 'Table's in the 'ManagerEnv': this could be 'bufferTable', 'threadTable', or
