@@ -467,7 +467,7 @@ editManagerEnvTable table = Manager . lift . Table.withinGroup table
 listManagerEnv :: DisplayInfo elem => Lens' ManagerEnvState (Table elem) -> Manager ()
 listManagerEnv inTable =
   editManagerEnvTable inTable $
-  Table.list Strict.putStr
+  Table.printRows Strict.putStr
 
 -- | Print a list of all data 'Buffer's in the 'ManagerEnv' that were created by 'newBuffer'.
 listBuffers :: Manager ()
