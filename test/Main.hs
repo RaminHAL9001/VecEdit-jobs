@@ -2,7 +2,7 @@ module Main where
 
 import VecEdit.Types
   ( RelativeDirection(..), Range(..), TextRange(..),
-    EditTextError(..), ppGapBufferErrorInfo, 
+    EditTextError(..), ppGapBufferErrorInfo,
   )
 
 import qualified VecEdit.Vector.Editor as Vector
@@ -81,8 +81,8 @@ testEditor = do
   edst <- Vector.newEditorState :: IO (Vector.EditorState MVector Strict.Text)
   flip Vector.evalEditor edst $ do
     let clean = do
-          Vector.filterBuffer (pure . not . Strict.null) >>=
-            Vector.withSubRange (Vector.fillWith "")
+          Vector.filterBuffer (pure . not . Strict.null) (\ () _ _ _ -> pure ()) () >>=
+            Vector.withSubRange (Vector.fillWith "") . fst
           liftIO $ Strict.putStrLn "buffer cleaned"
     Vector.newCurrentBuffer 1
     Vector.putCurrentElem "zero"
@@ -114,7 +114,7 @@ testEditor = do
       ]
     use Vector.currentCursor >>= \ i ->
       liftIO $ putStrLn $ "added " <> show i <> " elements"
-    found <- Vector.searchBuffer (pure . Strict.null)
+    (found, ()) <- Vector.searchBuffer (pure . Strict.null) (\ () _ _ _ -> pure ()) ()
     liftIO $ Strict.putStrLn $ "Search for null element -> " <> Strict.pack (show found)
     redisplay
     liftIO $ Strict.putStrLn "--------------------"
