@@ -5,11 +5,12 @@ module VecEdit.Jobs
   ( Manager, ManagerEnv, newManagerEnv, runManager,
     ManagerEnvState, bufferTable, workerTable, processTable,
     Buffer, TextTags, newBuffer, listBuffers, bufferHandle, bufferFile, showBuffer,
+    withBuffer, withBufferPath,
     Worker, WorkerStatus, listWorkers, getWorkerStatus, startWork,
     Process, listProcesses, runInBuffer, sendToProc, rerunProcess,
-    newReadPipeControl, pipeToBuffer,
+    ReadPipeControl, newReadPipeControl, pipeToBuffer,
+    SelectProcessBuffer(..), selectProcessBuffer, editProcessBuffer,
     GlobalTableSearchIndex(..),
-    withBuffer, withBufferPath,
   ) where
 
 import VecEdit.Types
@@ -53,7 +54,7 @@ import Data.Time.Clock (UTCTime, getCurrentTime)
 
 import System.IO (Handle, IOMode(ReadMode), openFile, hClose)
 import System.Process
-       ( ProcessHandle, CreateProcess, CmdSpec(..), Pid, StdStream(Inherit),
+       ( ProcessHandle, CreateProcess, CmdSpec(..), Pid, StdStream(CreatePipe),
          getPid, createProcess, cmdspec, std_in, std_out, waitForProcess
        )
 import System.Exit (ExitCode(..))
@@ -193,6 +194,31 @@ data ReadPipeControl fold
 
 -- | Objects of this data type allow input to be written to the standard input of a child process.
 newtype WritePipeControl = WritePipeControl Handle
+
+-- | Used by 'editProcessBuffer' to select the STDOUT or STDERR buffer.
+data SelectProcessBuffer = ProcessSTDOUT | ProcessSTDERR deriving (Eq, Ord, Show)
+
+-- | Evaluate a 'SelectProcessBuffer'
+selectProcessBuffer :: SelectProcessBuffer -> ProcessConfig -> Maybe (ReadPipeControl Int)
+selectProcessBuffer = \ case
+  ProcessSTDOUT -> theProcOutPipe
+  ProcessSTDERR -> theProcErrPipe
+
+-- | Given a child 'Process' and a 'SelectProcessBuffer' value, evaluate an 'EditText' function on
+-- that buffer. The buffer may not exist if the child process was created by 'Inherit'-ing the
+-- current process's output or error stream, or if the a file stream was created instead to capture
+-- the child process output or error streams. If for either of these reasons there is no process
+-- buffer, 'TextEditUndefined' is returned and the 'EditText' function is not evaluated.
+editProcessBuffer
+  :: SelectProcessBuffer
+  -> Process
+  -> EditText TextTags a
+  -> IO (Either EditTextError a)
+editProcessBuffer select (Process mvar) f =
+  readMVar mvar >>= \ cfg ->
+  case selectProcessBuffer select cfg >>= thePipeBuffer of
+    Nothing  -> pure $ Left TextEditUndefined
+    Just buf -> withBuffer0 buf f
 
 writePipeControl :: Maybe Handle -> Maybe WritePipeControl
 writePipeControl = fmap WritePipeControl
@@ -361,9 +387,9 @@ newProcessConfig exe = liftIO $ do
 -- table. If you configure an input pipe, you can dump strings to the process's standard input
 -- stream using the 'sendToProc' function. All output from the process created if buffered in the
 -- given 'Buffer'. Note that the 'CreateProcess' 'std_out' and 'std_in' fields are forced to
--- 'Inherit' regardless of it's value when passed to this function, this is to force the capture of
--- the process output into the given 'Buffer', and to allow input to be sent to the process, since
--- it will run asynchronously.
+-- 'CreatePipe' regardless of it's value when passed to this function, this is to force the capture
+-- of the process output into the given 'Buffer', and to allow input to be sent to the process,
+-- since it will run asynchronously.
 --
 -- This function returns a 'Table.Row' because, like with 'Buffer's, any new process created has a
 -- handle for it stored in a table in the 'Manager' monad execution environment so it can be retrieved
@@ -372,12 +398,12 @@ runInBuffer :: Table.Row Buffer -> CreateProcess -> Manager (Table.Row Process)
 runInBuffer buffer exe =
   editManagerEnvTable processTable $ do
     mvar <- liftIO $ do
-      cfg <- newProcessConfig (exe{ std_in = Inherit, std_out = Inherit })
+      cfg <- newProcessConfig (exe{ std_in = CreatePipe, std_out = CreatePipe })
       newMVar (cfg{ theProcCaptureBuffer = Just $ Table.theRowObject buffer })
     Table.insert (labelCreateProcess exe) $ Process mvar
 
 -- | If the 'Process' was created with the 'std_in' field of the 'CreateProcess' spec set to
--- 'Inherit', a 'Handle' is available for sending input to the Process (unless the 'Process' has
+-- 'CreatePipe', a 'Handle' is available for sending input to the Process (unless the 'Process' has
 -- recently closed this handle). This function allows you to send a string of input to the
 -- 'Process'.
 sendToProc :: MonadIO io => Table.Row Process -> StringData -> io ()
