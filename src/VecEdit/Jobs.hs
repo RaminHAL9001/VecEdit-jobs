@@ -4,12 +4,16 @@
 module VecEdit.Jobs
   ( Manager, ManagerEnv, newManagerEnv, runManager,
     ManagerEnvState, bufferTable, workerTable, processTable,
-    Buffer, TextTags, newBuffer, listBuffers, bufferHandle, bufferFile, showBuffer,
+    Buffer, TextTags, newBuffer,
+    bufferPrintAll, bufferList, bufferHandle, bufferFile, bufferFileInto, bufferShow,
     withBuffer, withBufferPath,
-    Worker, WorkerStatus, listWorkers, getWorkerStatus, startWork,
-    Process, listProcesses, runInBuffer, sendToProc, rerunProcess,
-    ReadPipeControl, newReadPipeControl, pipeToBuffer,
-    SelectProcessBuffer(..), selectProcessBuffer, editProcessBuffer,
+    Worker, WorkerStatus, startWork,
+    workerPrintAll, workerList, workerGetStatus,
+    Process, processWithBuffer, processNewBuffer, runProcess,
+    processPrintAll, processList,
+    processSend, processGetState, processWait, processCancel,
+    ProcessLog(..), processGetLog,
+    ReadPipeControl, newReadPipeControl, pipeToBuffer, editProcessBuffer,
     GlobalTableSearchIndex(..),
   ) where
 
@@ -20,7 +24,7 @@ import VecEdit.Types
 
 import VecEdit.Vector.Editor ( ralign6 )
 import VecEdit.Vector.Editor.GapBuffer ( newGapBufferState, rethrowErrorInfo )
-import VecEdit.Print.DisplayInfo (DisplayInfo(..), showAsText)
+import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoShow, showAsText)
 import VecEdit.Text.String
   ( TextLine, ReadLines, HaltReadLines, Word8GapBuffer, StringData,
     fromStringData, hReadLines, hReadLineBufferSize,
@@ -29,11 +33,12 @@ import VecEdit.Text.String
 import VecEdit.Text.Editor
   ( EditText, EditTextState, loadHandleEditText, loadHandleEditText,
     newEditTextState, runEditText, pushLine, foldLinesInRange,
+    maxLineIndex, validateBounds, mapRangeFreeze,
   )
 import qualified VecEdit.Table as Table
 import VecEdit.Table (Table)
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, yield)
 import Control.Concurrent.MVar
        (MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_, takeMVar, putMVar, withMVar)
 import Control.Exception (SomeException, IOException, try, catch)
@@ -49,13 +54,15 @@ import Data.Char (isSpace)
 import Data.Function (on)
 import qualified Data.Text as Strict
 import qualified Data.Text.IO as Strict
-import qualified Data.Text.Lazy as Lazy
 import Data.Time.Clock (UTCTime, getCurrentTime)
+import qualified Data.Vector as Vec
+import Data.Vector (Vector)
 
-import System.IO (Handle, IOMode(ReadMode), openFile, hClose)
+import System.IO (Handle, IOMode(ReadMode), openFile, hClose, hFlush)
 import System.Process
        ( ProcessHandle, CreateProcess, CmdSpec(..), Pid, StdStream(CreatePipe),
-         getPid, createProcess, cmdspec, std_in, std_out, waitForProcess
+         getPid, createProcess, cmdspec, std_in, std_out,
+         waitForProcess, interruptProcessGroupOf, getProcessExitCode,
        )
 import System.Exit (ExitCode(..))
 
@@ -125,13 +132,13 @@ instance Ord Worker where { compare = compare `on` theWorkerId; }
 instance DisplayInfo Worker where
   displayInfo putStr (Worker{theWorkerId=thid,theWorkerStatus=mvar}) = do
     stat <- readMVar mvar
-    putStr $ Lazy.toStrict $ showAsText thid
+    displayInfoShow putStr thid
     putStr " "
-    putStr $ Lazy.toStrict $ showAsText stat
+    displayInfoShow putStr stat
 
 -- | Get the state of operation of a 'Worker'.
-getWorkerStatus :: MonadIO io => Worker -> io WorkerStatus
-getWorkerStatus = liftIO . readMVar . theWorkerStatus
+workerGetStatus :: MonadIO io => Worker -> io WorkerStatus
+workerGetStatus = liftIO . readMVar . theWorkerStatus
 
 ----------------------------------------------------------------------------------------------------
 
@@ -178,6 +185,14 @@ instance DisplayInfo ProcessConfig where
 instance DisplayInfo Process where
   displayInfo putStr (Process mvar) = readMVar mvar >>= displayInfo putStr
 
+instance DisplayInfo ProcessState where
+  displayInfo putStr = \ case
+    ProcPending -> putStr "(pending)\n"
+    ProcRunning{theProcStatePid=pid} ->
+      mapM_ putStr ["(running, pid=", showAsText pid, ")\n"]
+    ProcHalted{theProcStateExitCode=exid} ->
+      mapM_ putStr ["(halted, ", showAsText exid, ")\n"]
+
 -- | An element of the 'ProcessState', if this is not 'Nothing' it indicates that 'theProcSpec' is
 -- defined to use the 'CreatePipe' flag to either 'std_out' or 'std_err'. If a pipe is created, the
 -- associated 'Handle' is passed to a function that runs in it's own thread to buffer all of the
@@ -195,28 +210,48 @@ data ReadPipeControl fold
 -- | Objects of this data type allow input to be written to the standard input of a child process.
 newtype WritePipeControl = WritePipeControl Handle
 
--- | Used by 'editProcessBuffer' to select the STDOUT or STDERR buffer.
-data SelectProcessBuffer = ProcessSTDOUT | ProcessSTDERR deriving (Eq, Ord, Show)
+-- | This data structure represents a portion of a process log. It is returned by 'processGetSTDOUT'
+-- and 'processGetSTDERR'. Values of this type are only for reporting, so there is a 'ToJSON'
+-- instance but no 'FromJSON' instance.
+data ProcessLog
+  = ProcessNotFound
+    { theProcessLogHandle :: !(Table.Row Process)
+    }
+  | ProcessTextError !EditTextError
+  | ProcessLog
+    { theProcessLogHandle :: !(Table.Row Process) -- ^ the 'Table.RowId' of the process
+    , theProcessLogRange :: !(TextRange LineIndex) -- ^ The range of lines retrieved
+    , theProcessLog :: !(Vector (TextLine TextTags))
+    }
 
--- | Evaluate a 'SelectProcessBuffer'
-selectProcessBuffer :: SelectProcessBuffer -> ProcessConfig -> Maybe (ReadPipeControl Int)
-selectProcessBuffer = \ case
-  ProcessSTDOUT -> theProcOutPipe
-  ProcessSTDERR -> theProcErrPipe
+instance DisplayInfo ProcessLog where
+  displayInfo putStr = \ case
+    ProcessNotFound{ theProcessLogHandle=row } -> do
+      putStr "process not found: "
+      displayInfo putStr row
+      putStr "\n"
+    ProcessTextError err -> do
+      displayInfo putStr err
+      putStr "\n"
+    ProcessLog{ theProcessLogHandle=row, theProcessLogRange=range, theProcessLog=vec } -> do
+      putStr "Process id="
+      displayInfo putStr row
+      putStr "\n"
+      forM_ (zip (iterate (+ 1) (theTextRangeStart range)) (Vec.toList vec)) $ \ (i, line) ->
+        putStr $ Strict.pack $ "  " <> ralign6 i <> ": " <> show line <> "\n"
 
--- | Given a child 'Process' and a 'SelectProcessBuffer' value, evaluate an 'EditText' function on
--- that buffer. The buffer may not exist if the child process was created by 'Inherit'-ing the
--- current process's output or error stream, or if the a file stream was created instead to capture
--- the child process output or error streams. If for either of these reasons there is no process
--- buffer, 'TextEditUndefined' is returned and the 'EditText' function is not evaluated.
+-- | Given a child 'Process' value, evaluate an 'EditText' function on that buffer. The buffer may
+-- not exist if the child process was created by 'Inherit'-ing the current process's output or error
+-- stream, or if the a file stream was created instead to capture the child process output or error
+-- streams. If for either of these reasons there is no process buffer, 'TextEditUndefined' is
+-- returned and the 'EditText' function is not evaluated.
 editProcessBuffer
-  :: SelectProcessBuffer
-  -> Process
+  :: Table.Row Process
   -> EditText TextTags a
   -> IO (Either EditTextError a)
-editProcessBuffer select (Process mvar) f =
-  readMVar mvar >>= \ cfg ->
-  case selectProcessBuffer select cfg >>= thePipeBuffer of
+editProcessBuffer row f =
+  let (Process mvar) = Table.theRowObject row in
+  theProcCaptureBuffer <$> readMVar mvar >>= \ case
     Nothing  -> pure $ Left TextEditUndefined
     Just buf -> withBuffer0 buf f
 
@@ -304,8 +339,8 @@ labelCreateProcess mkproc =
     ShellCommand path -> Strict.pack $ takeWhile (not . isSpace) $ dropWhile isSpace path
     RawCommand path args -> Strict.unwords $ Strict.pack <$> (path : args)
 
-rerunProcess0 :: MonadIO io => Process -> io ()
-rerunProcess0 (Process mvar) =
+runProcess0 :: MonadIO io => Process -> io ()
+runProcess0 (Process mvar) =
   liftIO $
   modifyMVar_ mvar $ \ cfg -> do
     (pin, pout, perr, phandle) <- createProcess $ theProcSpec cfg
@@ -359,10 +394,11 @@ rerunProcess0 (Process mvar) =
           , theProcEndTime = Nothing
           }
 
--- | Re-run a particular 'Process'. The 'Table.Row' entry is reused, so it will have the same row ID
--- and label as before, and will remain in the process table in the same position as before.
-rerunProcess :: MonadIO io => Table.Row Process -> io ()
-rerunProcess = void . rerunProcess0 . Table.theRowObject
+-- | Run a particular 'Process' that has been created by 'processNewBuffer' or
+-- 'processWithBuffer'. The 'Table.Row' entry is reused, so it will have the same row ID and label
+-- as before, and will remain in the process table in the same position as before.
+runProcess :: MonadIO io => Table.Row Process -> io ()
+runProcess = void . runProcess0 . Table.theRowObject
 
 -- | not for export
 --
@@ -383,37 +419,102 @@ newProcessConfig exe = liftIO $ do
     , theProcCaptureBuffer = Nothing
     }
 
--- | Run an external system process from a 'CreateProcess' spec, store it's output in the process
--- table. If you configure an input pipe, you can dump strings to the process's standard input
--- stream using the 'sendToProc' function. All output from the process created if buffered in the
--- given 'Buffer'. Note that the 'CreateProcess' 'std_out' and 'std_in' fields are forced to
--- 'CreatePipe' regardless of it's value when passed to this function, this is to force the capture
--- of the process output into the given 'Buffer', and to allow input to be sent to the process,
--- since it will run asynchronously.
+-- | Given a 'CreateProcess' spec, create an external system 'Process' to be run by 'runProcess',
+-- and prepare to store it's output in the process table. The 'Process' will not actually be
+-- executed until 'runProcess' is called on the 'Process' handle created by this function.
+--
+-- If you configure an input pipe, you can dump strings to the process's standard input stream using
+-- the 'processSend' function. All output from the process created if buffered in the given
+-- 'Buffer'. Note that the 'CreateProcess' 'std_out' and 'std_in' fields are forced to 'CreatePipe'
+-- regardless of it's value when passed to this function, this is to force the capture of the
+-- process output into the given 'Buffer', and to allow input to be sent to the process, since it
+-- will run asynchronously.
 --
 -- This function returns a 'Table.Row' because, like with 'Buffer's, any new process created has a
 -- handle for it stored in a table in the 'Manager' monad execution environment so it can be retrieved
 -- at any time.
-runInBuffer :: Table.Row Buffer -> CreateProcess -> Manager (Table.Row Process)
-runInBuffer buffer exe =
+processWithBuffer :: Table.Row Buffer -> CreateProcess -> Manager (Table.Row Process)
+processWithBuffer buffer exe =
   editManagerEnvTable processTable $ do
     mvar <- liftIO $ do
       cfg <- newProcessConfig (exe{ std_in = CreatePipe, std_out = CreatePipe })
       newMVar (cfg{ theProcCaptureBuffer = Just $ Table.theRowObject buffer })
     Table.insert (labelCreateProcess exe) $ Process mvar
 
+-- | Like 'processWithBuffer', but automatically creates a new 'Buffer' to capture STDOUT (and
+-- STDERR is always captured, regardless of which method starts it). The 'Process' and 'Buffer'
+-- handles are both returned.
+processNewBuffer :: CreateProcess -> Manager (Table.Row Buffer, Table.Row Process)
+processNewBuffer exe = do
+  buffer <- newBuffer (Strict.pack $ "STDOUT: " <> show (cmdspec exe)) 63
+  process <- processWithBuffer buffer exe
+  pure (buffer, process)
+
 -- | If the 'Process' was created with the 'std_in' field of the 'CreateProcess' spec set to
 -- 'CreatePipe', a 'Handle' is available for sending input to the Process (unless the 'Process' has
 -- recently closed this handle). This function allows you to send a string of input to the
 -- 'Process'.
-sendToProc :: MonadIO io => Table.Row Process -> StringData -> io ()
-sendToProc row str = liftIO $ do
-  let (Process mvar) = Table.theRowObject row
+processSend :: MonadIO io => Table.Row Process -> StringData -> io ()
+processSend row str = liftIO $
+  let (Process mvar) = Table.theRowObject row in
   withMVar mvar $ \ cfg -> case theProcInPipe cfg of
     Nothing -> fail $ show (Table.theRowLabel row) <> " process created without input pipe"
     Just (WritePipeControl handle) -> case fromStringData str of
       Nothing -> pure ()
-      Just txt -> Strict.hPutStr handle txt
+      Just txt -> Strict.hPutStr handle txt >> hFlush handle
+
+-- | Get the 'ProcessState' for a 'Process'.
+processGetState :: MonadIO io => Table.Row Process -> io ProcessState
+processGetState row = liftIO $
+  let (Process mvar) = Table.theRowObject row in
+  theProcState <$> readMVar mvar
+
+-- | Send a signal to the given 'Process' handle forcing it to halt. This uses
+-- 'interruptProcessGroupOf', which sends the POSIX signal @SIGINT@ ("interrupt") to the operating
+-- system process.
+processCancel :: MonadIO io => Table.Row Process -> io (Maybe ExitCode)
+processCancel = processGetState >=> liftIO . \ case
+  ProcPending -> pure Nothing
+  ProcRunning{theProcStateProcHandle=procHandle} -> do
+    interruptProcessGroupOf procHandle
+    yield
+    getProcessExitCode procHandle
+  ProcHalted{theProcStateExitCode=code} -> pure $ Just code
+
+-- | Synchrnous wait on 'Process' completion, that is, freeze the current thread until the 'Process'
+-- completes, then return the 'ProcessState' with the 'ExitCode'. Returns 'Nothing' if the 'Process'
+-- has not started yet.
+processWait :: MonadIO io => Table.Row Process -> io (Maybe ExitCode)
+processWait = processGetState >=> liftIO . \ case
+  ProcPending -> pure Nothing
+  ProcRunning{ theProcStateProcHandle=procHandle } -> Just <$> waitForProcess procHandle
+  ProcHalted{ theProcStateExitCode=code } -> pure $ Just code
+
+-- | Obtain lines of text from the 'ProcessSTDOUT' or 'ProcessSTDERR' of a 'Process' that have been
+-- cached in a buffer.
+processGetLog
+  :: MonadIO m
+  => Table.Row Process
+  -> LineIndex
+  -> Maybe LineIndex
+  -> m ProcessLog
+processGetLog row fromLine toLine =
+  liftIO $
+  fmap
+  (\ case
+    Left err -> ProcessTextError err
+    Right ok -> ok
+  ) $
+  editProcessBuffer row $
+  TextRange <$>
+  validateBounds fromLine <*>
+  maybe maxLineIndex validateBounds toLine >>= \ range ->
+  mapRangeFreeze range (const pure) >>= \ vec ->
+  pure ProcessLog
+  { theProcessLogHandle = row
+  , theProcessLogRange = range
+  , theProcessLog = vec
+  }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -490,26 +591,48 @@ editManagerEnvTable table = Manager . lift . Table.withinGroup table
 
 -- | List one of the 'Table's in the 'ManagerEnv': this could be 'bufferTable', 'threadTable', or
 -- 'processTable'.
-listManagerEnv :: DisplayInfo elem => Lens' ManagerEnvState (Table elem) -> Manager ()
+listManagerEnv
+  :: Lens' ManagerEnvState (Table elem)
+  -> (Table.Row elem -> IO Bool)
+  -> Manager (Vector (Table.Row elem))
 listManagerEnv inTable =
+  editManagerEnvTable inTable .
+  Table.list
+
+-- | Print to stdout one of the 'Table's in the 'ManagerEnv': this could be 'bufferTable',
+-- 'threadTable', or 'processTable'.
+printManagerEnv :: DisplayInfo elem => Lens' ManagerEnvState (Table elem) -> Manager ()
+printManagerEnv inTable =
   editManagerEnvTable inTable $
   Table.printRows Strict.putStr
 
 -- | Print a list of all data 'Buffer's in the 'ManagerEnv' that were created by 'newBuffer'.
-listBuffers :: Manager ()
-listBuffers = listManagerEnv bufferTable
+bufferPrintAll :: Manager ()
+bufferPrintAll = printManagerEnv bufferTable
+
+-- | Print a list of all data 'Buffer's in the 'ManagerEnv' that were created by 'newBuffer'.
+bufferList :: (Table.Row Buffer -> IO Bool) -> Manager (Vector (Table.Row Buffer))
+bufferList = listManagerEnv bufferTable
 
 -- | Print a list of all managed 'Worker' threads that are known to the 'ManagerEnv', meaning they were
 -- created by the 'startWork' function. The 'ManagerEnv' execution context cannot track threads created
 -- by 'forkIO' or 'forkOS'.
-listWorkers :: Manager ()
-listWorkers = listManagerEnv workerTable
+workerPrintAll :: Manager ()
+workerPrintAll = printManagerEnv workerTable
+
+workerList :: (Table.Row Worker -> IO Bool) -> Manager (Vector (Table.Row Worker))
+workerList = listManagerEnv workerTable
 
 -- | Prints a list of all child 'Process's that are known to the 'ManagerEnv' created by
--- 'runInBuffer'. The 'ManagerEnv' execution context cannot track processes created by 'createProcess'
--- or any of its convenient functional wrappers.
-listProcesses :: Manager ()
-listProcesses = listManagerEnv processTable
+-- 'runProcessWithBuffer'. The 'ManagerEnv' execution context cannot track processes created by
+-- 'createProcess' or any of its convenient functional wrappers.
+processPrintAll :: Manager ()
+processPrintAll = printManagerEnv processTable
+
+-- | Construct a list (actually 'Vector') of 'Process's from the process table that match the
+-- given predicate.
+processList :: (Table.Row Process -> IO Bool) -> Manager (Vector (Table.Row Process))
+processList = editManagerEnvTable processTable . Table.list 
 
 hackEnvTableSelect1
   :: Lens' ManagerEnvState (Table elem)
@@ -519,7 +642,7 @@ hackEnvTableSelect1 inTable testElem =
   editManagerEnvTable inTable $
   Table.select1 testElem
 
--- | Create a new 'Worker', passing a 'Label' to identify the worker in the 'listWorkers' table, and
+-- | Create a new 'Worker', passing a 'Label' to identify the worker in the 'workerList' table, and
 -- a task of type @IO ()@ to perform.
 --
 -- This function returns a 'Table.Row' because, like with 'Buffer's, any new 'Worker' thread created
@@ -602,8 +725,8 @@ withBuffer :: MonadIO io => Table.Row Buffer -> EditText TextTags a -> io (Eithe
 withBuffer = withBuffer0 . Table.theRowObject
 
 -- | Pretty-print each line of data in a 'Buffer'.
-showBuffer :: MonadIO io => Table.Row Buffer -> TextRange LineIndex -> io (Either EditTextError ())
-showBuffer row range =
+bufferShow :: MonadIO io => Table.Row Buffer -> TextRange LineIndex -> io (Either EditTextError ())
+bufferShow row range =
   withBuffer row $
   foldLinesInRange range
   (\ _halt lineNum line -> liftIO $ do
@@ -626,13 +749,20 @@ bufferHandle label row handle =
   withBuffer row $
   loadHandleEditText Nothing handle
 
--- | Load a file from the given path, return a reference to the 'Buffer' and the 'Worker' that was
+-- | Load a file from the given file path into the given 'Buffer'. Returns the 'Worker' that was
 -- used to load the buffer.
+bufferFileInto :: Strict.Text -> Table.Row Buffer -> Manager (Table.Row Worker)
+bufferFileInto path buffer = do
+  handle <- liftIO $ openFile (Strict.unpack path) ReadMode
+  worker <- bufferHandle ("(bufferFile " <> Strict.pack (show path) <> ")") buffer handle
+  return worker
+
+-- | Like 'bufferFileInto' but creates a new buffer and returns it paired with the 'Worker' that
+-- buffers the file.
 bufferFile :: Strict.Text -> Manager (Table.Row Worker, Table.Row Buffer)
 bufferFile path = do
-  handle <- liftIO $ openFile (Strict.unpack path) ReadMode
   buffer <- newBuffer path 128
-  worker <- bufferHandle ("(bufferFile " <> Strict.pack (show path) <> ")") buffer handle
+  worker <- bufferFileInto path buffer
   return (worker, buffer)
 
 ----------------------------------------------------------------------------------------------------

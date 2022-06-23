@@ -24,7 +24,7 @@ import VecEdit.Text.Editor
     lineNumber, flushLine, loadHandleEditText, cursorToEnd, insertString,
     foldLinesFromCursor, loadHandleEditText, debugViewTextEditor,
   )
-import VecEdit.Jobs (Manager, Buffer, withBuffer, newBuffer, showBuffer)
+import VecEdit.Jobs (Manager, Buffer, withBuffer, newBuffer, bufferShow)
 import qualified VecEdit.Table as Table
 
 import VecEdit.Text.TokenizerTable (tokTableFold)
@@ -225,7 +225,7 @@ testTextEditor = do
       lineNumber
   case result of
     Right line ->
-      showBuffer buf (TextRange 1 line) >>= \ case
+      bufferShow buf (TextRange 1 line) >>= \ case
         Right () -> return buf
         Left err -> error (show err)
     Left  err  -> error (show err)
@@ -271,7 +271,7 @@ testByteStreamToLines = do
   --
   -- Test 'byteStreamToLines' on a file via the 'hReadLines' function.
   buf <- newGapBufferState (Just 0) 128
-  h <- openFile "./emacs-hacker.cabal" ReadMode
+  h <- openFile "./VecEdit-jobs.cabal" ReadMode
   flip (hReadLines buf h) (1::Int) $ \ _halt line -> do
     i <- get
     liftIO $ putStrLn $ show i <> ": " <> show (line :: TextLine ())
@@ -285,7 +285,7 @@ main :: IO ()
 main =
   newEditTextState 128 >>=
   ( evalEditText $
-    liftIO (openFile "./emacs-hacker.cabal" ReadMode) >>=
+    liftIO (openFile "./VecEdit-jobs.cabal" ReadMode) >>=
     loadHandleEditText Nothing >>
     (do cursorToEnd Before
         flip (foldLinesFromCursor After) (1::Int) $ \ _halt i line -> do

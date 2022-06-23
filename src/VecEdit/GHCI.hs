@@ -6,13 +6,14 @@
 module VecEdit.GHCI
   ( main,
     -- ** Data Buffers
-    Manager.Buffer, Manager.bufferTable, newBuffer, listBuffers, bufferHandle, bufferFile,
-    Manager.withBufferPath, Manager.showBuffer,
+    Manager.Buffer, Manager.bufferTable, newBuffer, bufferPrintAll, bufferHandle, bufferFile,
+    Manager.withBufferPath, Manager.bufferShow,
     -- ** Worker Threads
-    Manager.Worker, Manager.workerTable, listWorkers, startWork, Manager.getWorkerStatus,
+    Manager.Worker, Manager.workerTable, workerPrintAll, startWork, Manager.workerGetStatus,
     -- ** Child Processes
-    Manager.Process, Manager.processTable, listProcesses, runInBuffer, withBuffer,
-    Manager.rerunProcess, Manager.pipeToBuffer, Manager.newReadPipeControl, Manager.sendToProc,
+    Manager.Process, Manager.processTable, processPrintAll, runInBuffer, withBuffer,
+    Manager.runProcess, Manager.pipeToBuffer, Manager.newReadPipeControl, Manager.processSend,
+    Manager.processWait, Manager.processGetLog, Manager.processGetState,
     -- ** Lifting 'Manager' functions
     ManagerEnv, Manager, ioManager,
     -- ** Testing
@@ -119,20 +120,20 @@ startWork
 startWork = fmap (fmap ioManager) Manager.startWork
 
 -- | Print a list of all data 'Buffer's in the 'ManagerEnv' that were created by 'newBuffer'.
-listBuffers :: IO ()
-listBuffers = ioManager Manager.listBuffers
+bufferPrintAll :: IO ()
+bufferPrintAll = ioManager Manager.bufferPrintAll
 
 -- | Print a list of all managed 'Worker' threads that are known to the 'ManagerEnv', meaning they were
 -- created by the 'startWork' function. The 'ManagerEnv' execution context cannot track threads created
 -- by 'forkIO' or 'forkOS'.
-listWorkers :: IO ()
-listWorkers = ioManager Manager.listWorkers
+workerPrintAll :: IO ()
+workerPrintAll = ioManager Manager.workerPrintAll
 
 -- | Prints a list of all child 'Process's that are known to the 'ManagerEnv' created by
 -- 'runInBuffer'. The 'ManagerEnv' execution context cannot track processes created by 'createProcess'
 -- or any of its convenient functional wrappers.
-listProcesses :: IO ()
-listProcesses = ioManager Manager.listProcesses
+processPrintAll :: IO ()
+processPrintAll = ioManager Manager.processPrintAll
 
 -- | Run an external system process from a 'CreateProcess' spec, store it's output in the process
 -- table. If you configure an input pipe, you can dump strings to the process's standard input
@@ -146,7 +147,7 @@ listProcesses = ioManager Manager.listProcesses
 -- handle for it stored in a table in the 'Manager' monad execution environment so it can be retrieved
 -- at any time.
 runInBuffer :: Table.Row Manager.Buffer -> CreateProcess -> IO (Table.Row Manager.Process)
-runInBuffer = fmap (fmap ioManager) Manager.runInBuffer
+runInBuffer = fmap (fmap ioManager) Manager.processWithBuffer
 
 ----------------------------------------------------------------------------------------------------
 
@@ -329,7 +330,7 @@ testTextEditor = do
       lineNumber
   case result of
     Right line ->
-      Manager.showBuffer buf (TextRange 1 line) >>= \ case
+      Manager.bufferShow buf (TextRange 1 line) >>= \ case
         Right () -> return buf
         Left err -> error (show err)
     Left  err  -> error (show err)
