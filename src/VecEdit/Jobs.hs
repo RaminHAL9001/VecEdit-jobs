@@ -2,33 +2,62 @@
 -- @STDIN@, @STDOUT@, and @STDERR@ of each process is captured in a
 -- text buffer.
 module VecEdit.Jobs
-  ( Manager, ManagerEnv, newManagerEnv, runManager,
+  ( -- ** The 'Manager' monad
+    Manager, ManagerEnv, newManagerEnv, runManager,
     ManagerEnvState, bufferTable, workerTable, processTable,
+
+    -- ** Text 'Buffer's
     Buffer, TextTags, newBuffer,
     bufferPrintAll, bufferList, bufferHandle, bufferFile, bufferFileInto, bufferShow,
     withBuffer, withBufferPath,
+
+    -- ** 'Worker's (threads)
     Worker, WorkerStatus, startWork,
     workerPrintAll, workerList, workerGetStatus,
-    Process, processWithBuffer, processNewBuffer, runProcess,
+
+    -- ** 'Process'es and Jobs
+    -- 
+    -- These APIs deal with setting up jobs (POSIX processes), requesting the operating system run a
+    -- child process, capturing the output and error streams of a child process, sending input to a
+    -- child process input stream, and sending POSIX signals to the child process.
+    
+    -- *** Configuring a child process
+    --
+    -- You can configure a child process for synchronous or asynchronous execution. When
+    -- asynchronous, there are several options for capturing the output and error streams of a child
+    -- process. You can also define your own continuation for receiving raw strings from the output
+    -- and error streams via an IO 'Handle'. Once a process is created and in the process table, it
+    -- can be run as a job.
+    ProcessConfig(..), ProcessProgramFile,
+    PipeSenderConfig(..), PipeReceiverConfig(..),
+    synchronous, asynchronous, asyncCapture, asyncCaptureNewBuffer,
+
+    -- *** Custom 'PipeReceiverConfigFunction' configurations
+    bufferReceiveLines, bufferReceiveLinesPut,
+    
+    -- *** Running a 'Process' as a job
+    Process, newProcess, runProcess,
     processPrintAll, processList,
     processSend, processGetState, processWait, processCancel,
-    ProcessLog(..), processGetLog,
-    ReadPipeControl, newReadPipeControl, pipeToBuffer, editProcessBuffer,
+    processGetCaptureBuffer,
+    GetProcessBuffer(..), ProcessLog(..), processGetLog,
+
+    -- ** Inspecting global state
     GlobalTableSearchIndex(..),
   ) where
 
 import VecEdit.Types
   ( VectorSize, RelativeDirection(..), TextRange(..), LineIndex(..),
-    GapBufferError(..), EditTextError(..),
+    EditTextError(..),
   )
 
 import VecEdit.Vector.Editor ( ralign6 )
-import VecEdit.Vector.Editor.GapBuffer ( newGapBufferState, rethrowErrorInfo )
+import VecEdit.Vector.Editor.GapBuffer (newGapBufferState)
 import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoShow, showAsText)
 import VecEdit.Text.String
-  ( TextLine, ReadLines, HaltReadLines, Word8GapBuffer, StringData,
-    fromStringData, hReadLines, hReadLineBufferSize,
-    readLinesLiftGapBuffer, convertString, theTextLineData,
+  ( TextLine, ReadLines, HaltReadLines, StringData,
+    fromStringData, bytesFromString, hReadLines, hReadLineBufferSize,
+    convertString, theTextLineData,
   )
 import VecEdit.Text.Editor
   ( EditText, EditTextState, loadHandleEditText, loadHandleEditText,
@@ -38,19 +67,18 @@ import VecEdit.Text.Editor
 import qualified VecEdit.Table as Table
 import VecEdit.Table (Table)
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, yield)
+import Control.Concurrent (ThreadId, forkIO, yield)
 import Control.Concurrent.MVar
        (MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_, takeMVar, putMVar, withMVar)
-import Control.Exception (SomeException, IOException, try, catch)
-import Control.Lens (Lens', lens, use, (^.), (%=), (.=))
+import Control.Exception (SomeException, catch)
+import Control.Lens (Lens', lens, use, (^.), (.~), (%=), (.=))
 import Control.Monad -- re-exporting
-import Control.Monad.Except (MonadError(..))
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Reader (MonadReader, ask, ReaderT(..))
-import Control.Monad.State (StateT(..), runStateT, modify)
+import Control.Monad.State (StateT(..), MonadState(..), runStateT)
 import Control.Monad.Trans (lift)
 
-import Data.Char (isSpace)
+import qualified Data.ByteString as Bytes
 import Data.Function (on)
 import qualified Data.Text as Strict
 import qualified Data.Text.IO as Strict
@@ -58,18 +86,13 @@ import Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Data.Vector as Vec
 import Data.Vector (Vector)
 
-import System.IO (Handle, IOMode(ReadMode), openFile, hClose, hFlush)
+import System.IO (Handle, IOMode(..), openFile, hClose, hFlush)
+import qualified System.Process as Exec
 import System.Process
-       ( ProcessHandle, CreateProcess, CmdSpec(..), Pid, StdStream(CreatePipe),
-         getPid, createProcess, cmdspec, std_in, std_out,
-         waitForProcess, interruptProcessGroupOf, getProcessExitCode,
+       ( ProcessHandle,
+         waitForProcess, getProcessExitCode, interruptProcessGroupOf
        )
 import System.Exit (ExitCode(..))
-
-----------------------------------------------------------------------------------------------------
-
-textShow :: Show a => a -> Strict.Text
-textShow = Strict.pack . show
 
 ----------------------------------------------------------------------------------------------------
 
@@ -148,67 +171,120 @@ newtype Process = Process (MVar ProcessConfig)
 
 data ProcessConfig
   = ProcessConfig
-    { theProcSpec :: !CreateProcess
-    , theProcState :: !ProcessState
-    , theProcInPipe :: !(Maybe WritePipeControl)
-    , theProcOutPipe :: !(Maybe (ReadPipeControl Int))
-    , theProcErrPipe :: !(Maybe (ReadPipeControl Int))
-    , theProcWaitThread :: !ThreadId
-    , theProcStartTime :: !(Maybe UTCTime)
-    , theProcEndTime :: !(Maybe UTCTime)
-    , theProcCaptureBuffer :: !(Maybe Buffer)
+    { theProcConfigCommand :: !ProcessProgramFile
+    , theProcConfigArgs :: !(Vector Strict.Text)
+    , theProcConfigInPipe :: !PipeSenderConfig
+    , theProcConfigOutPipe :: !PipeReceiverConfig
+    , theProcConfigErrPipe :: !PipeReceiverConfig
+    , theProcConfigState :: !ProcessState
     }
+
+-- | When a function takes an argument of this type, the given 'Strict.Text' string must be a path
+-- to an executable program file somewhere in the file system.
+type ProcessProgramFile = Strict.Text
+
+-- | This data type is part of a 'ProcessConfig', and is used to configure how the STDIN stream of a
+-- child process will be used.
+data PipeSenderConfig
+  = PipeSenderConfigClose -- ^ Close the sender file handle as soon as the process is craeted.
+  | PipeSenderConfigInherit -- ^ Use the sender file handle for the current process
+  | PipeSenderConfigPipe -- ^ Create a pipe for sending to the child process
+  | PipeSenderConfigRedirect !Handle -- ^ Use an already open pipe as the input for the child process
+
+-- | This data type is a part of a 'ProcessState' for a 'ProcRunning' (running process).  It
+-- contains information necessary to enact the 'PipeReceiveConfig' semantics for both STDOUT and
+-- STDERR streams.
+newtype PipeSender = PipeSender (Maybe Handle)
+
+-- | This data type is part of a 'ProcessConfig' controlling how the STDOUT and STDERR streams of a
+-- process will be used.
+data PipeReceiverConfig
+  = PipeReceiverConfigClose -- ^ Close the stream after forking the child process.
+  | PipeReceiverConfigInherit -- ^ Inherit the pipe from the current process
+  | PipeReceiverConfigNewBuffer -- ^ Launch a thread to capture the 'Handle' into a newly created 'Buffer'.
+  | PipeReceiverConfigBuffer
+    { pipeControlBuffer :: !(Table.Row Buffer)
+    }  -- ^ Launch a thread to capture the 'Handle' into a 'Buffer'.
+  | PipeReceiverConfigHandle
+    { pipeControlHandle :: !Handle
+    } -- ^ Redirect to an already-open 'Handle'
+  | PipeReceiverConfigFile
+    { pipeControlFile :: !Strict.Text
+    , pipeControlAppend :: !Bool
+      -- ^ 'True' -> 'AppendMode', 'False' -> 'WriteMode' (truncate)
+    } -- ^ Redirect to a 'Handle' by opening the given file path.
+  | PipeReceiverConfigNewBufferWithFile
+    { pipeControlFile :: !Strict.Text
+    , pipeControlAppend :: !Bool
+      -- ^ 'True' -> 'AppendMode', 'False' -> 'WriteMode' (truncate)
+    } -- ^ Launch a thread to capture the 'Handle' into a 'Buffer', but also write captured output
+      -- to a file.
+  | PipeReceiverConfigFunction
+    { pipeControlDescription :: !Strict.Text
+    , pipeControlFunction :: !(Handle -> IO (Either EditTextError ()))
+    } -- ^ Launch a thread to read or write the 'Handle'. Provide a descriptive string, otherwise
+     -- what this function actually does with the 'Handle' is completely opaque. For all other
+     -- stream receiver/sender mechanisms that are not handled by the other constructors of this
+     -- data type, you can define your own with this constructor.
+
+-- | This data type is a part of a 'ProcessState' for a 'ProcRunning' (running process). It contains
+-- information necessary to enact the 'PipeReceiverConfig' semantics for both STDOUT and STDERR
+-- streams.
+data PipeReceiver
+  = PipeReceiverNothing
+  | PipeReceiverInherit
+  | PipeReceiverHandle{ pipeConnectHandle :: !Handle }
+    -- ^ Redirect to an already-open 'Handle'
+  | PipeReceiverFile
+    { pipeConnectFile :: !Strict.Text
+    , pipeConnectFileAppend :: !Bool
+      -- ^ Only relevant for receiver pipes. This is ignored for sender pipes.
+    , pipeConnectHandle :: !Handle
+    }
+  | PipeReceiverBuffer
+    { pipeConnectHandle :: !Handle
+    , pipeConnectBuffer :: !(Table.Row Buffer)
+    , pipeConnectThread :: !ThreadId
+    , pipeConnectWaitClose :: !(MVar (Either EditTextError ()))
+    }
+  | PipeReceiverNewBufferWithFile
+    { pipeConnectHandle :: !Handle
+    , pipeConnectFileHandle :: !Handle
+    , pipeConnectFile :: !Strict.Text
+    , pipeConnectFileAppend :: !Bool
+      -- ^ Only relevant for receiver pipes. This is ignored for sender pipes.
+    , pipeConnectBuffer :: !(Table.Row Buffer)
+    , pipeConnectThread :: !ThreadId
+    , pipeConnectWaitClose :: !(MVar (Either EditTextError ()))
+    }
+  | PipeReceiverFunction
+    { pipeConnectDescription :: !Strict.Text
+    , pipeConnectHandle :: !Handle
+    , pipeConnectThread :: !ThreadId
+    , pipeConnectWaitClose :: !(MVar (Either EditTextError ()))
+    } -- ^ For all other stream receiver/sender mechanisms that are not handled by the other
+      -- constructors of this data type, you can define your own with this constructor.
 
 -- | Describes what state a 'Process' is in.
 data ProcessState
   = ProcPending -- ^ Process is configured but hasn't been run yet.
   | ProcRunning
     { theProcStateProcHandle :: !ProcessHandle
-    , theProcStatePid :: !Pid
+    , theProcStatePid :: !Exec.Pid
+    , theProcWaitThread :: !ThreadId
+    , theProcStartTime :: !UTCTime
+    , theProcInPipe :: !PipeSender
+    , theProcOutPipe :: !PipeReceiver
+    , theProcErrPipe :: !PipeReceiver
     } -- ^ Process is running with this given handle.
   | ProcHalted
     { theProcStateExitCode :: !ExitCode
+    , theProcStartTime :: !UTCTime
+    , theProcEndTime :: !UTCTime
+    , theProcInPipe :: !PipeSender
+    , theProcOutPipe :: !PipeReceiver
+    , theProcErrPipe :: !PipeReceiver
     } -- ^ Process halted with this exit code.
-
-instance Show ProcessState where
-  show = \ case
-    ProcPending -> "ProcPending"
-    ProcRunning{theProcStatePid=pid} -> "ProcRunning " <> show pid
-    ProcHalted{theProcStateExitCode=exid} -> "ProcHalted " <> show exid
-
-instance DisplayInfo ProcessConfig where
-  displayInfo putStr cfg = do
-    putStr $ Strict.pack $ show $ theProcState cfg
-    putStr " "
-    putStr $ Strict.pack $ show $ theProcSpec cfg
-
-instance DisplayInfo Process where
-  displayInfo putStr (Process mvar) = readMVar mvar >>= displayInfo putStr
-
-instance DisplayInfo ProcessState where
-  displayInfo putStr = \ case
-    ProcPending -> putStr "(pending)\n"
-    ProcRunning{theProcStatePid=pid} ->
-      mapM_ putStr ["(running, pid=", showAsText pid, ")\n"]
-    ProcHalted{theProcStateExitCode=exid} ->
-      mapM_ putStr ["(halted, ", showAsText exid, ")\n"]
-
--- | An element of the 'ProcessState', if this is not 'Nothing' it indicates that 'theProcSpec' is
--- defined to use the 'CreatePipe' flag to either 'std_out' or 'std_err'. If a pipe is created, the
--- associated 'Handle' is passed to a function that runs in it's own thread to buffer all of the
--- characters read-from/written-to the 'Handle'. If the buffered characters are also stored into a
--- 'Buffer' 'thePipeBuffer' will be non-'Nothing' so you can retrieve the 'Buffer' to which this
--- process buffered lines.
-data ReadPipeControl fold
-  = ReadPipeControl
-    { thePipeHandle :: !Handle
-    , thePipeThread :: !ThreadId
-    , thePipeBuffer :: !(Maybe Buffer)
-    , thePipeWaitClose :: !(MVar (Either EditTextError (), fold))
-    }
-
--- | Objects of this data type allow input to be written to the standard input of a child process.
-newtype WritePipeControl = WritePipeControl Handle
 
 -- | This data structure represents a portion of a process log. It is returned by 'processGetSTDOUT'
 -- and 'processGetSTDERR'. Values of this type are only for reporting, so there is a 'ToJSON'
@@ -223,6 +299,64 @@ data ProcessLog
     , theProcessLogRange :: !(TextRange LineIndex) -- ^ The range of lines retrieved
     , theProcessLog :: !(Vector (TextLine TextTags))
     }
+
+instance Show ProcessConfig where
+  show cfg =
+    "(ProcessConfig " <> show (theProcConfigCommand cfg) <>
+    " " <> show (show <$> Vec.toList (theProcConfigArgs cfg)) <>
+    " :stdout " <> show (theProcConfigOutPipe cfg) <>
+    " :stderr " <> show (theProcConfigErrPipe cfg) <>
+    " :state " <> show (theProcConfigState cfg) <>
+    ")"
+
+instance Show PipeReceiverConfig where
+  show = \ case
+    PipeReceiverConfigClose -> "(close)"
+    PipeReceiverConfigInherit -> "(inherit)"
+    PipeReceiverConfigNewBuffer -> "(capture-new-buffer)"
+    PipeReceiverConfigBuffer buf -> "(capture-buffer " <> show (Table.theRowLabel buf) <> ")"
+    PipeReceiverConfigHandle _ -> "(file-handle)"
+    PipeReceiverConfigFile file _ -> "(file " <> show file <> ")"
+    PipeReceiverConfigNewBufferWithFile file append ->
+      "(capture-buffer " <> show file <> (if append then ":append-mode" else "") <> ")"
+    PipeReceiverConfigFunction desc _ -> "(capturing " <> show desc <> ")"
+
+instance Show PipeReceiver where
+  show = \ case
+    PipeReceiverNothing -> "(none)"
+    PipeReceiverInherit -> "(inherited)"
+    PipeReceiverHandle _ -> "(redirect)"
+    PipeReceiverFile file append _ ->
+      "(redirect-file " <> show file <>
+      (if append then " :append-mode" else "") <> ")"
+    PipeReceiverBuffer _ buf thid _ ->
+      "(capture-buffer " <> show thid <> " " <> show (Table.theRowLabel buf) <> ")"
+    PipeReceiverNewBufferWithFile _ _ file append buf thid _ ->
+      "(capture-buffer-log-file " <> show file <>
+      (if append then " :append-mode" else "") <>
+      show thid <> " " <> show (Table.theRowLabel buf) <> ")"
+    PipeReceiverFunction desc _ thid _ ->
+      "(captured " <> show desc <> " :" <> show thid <> ")"
+
+instance Show ProcessState where
+  show = \ case
+    ProcPending -> "ProcPending"
+    ProcRunning{theProcStatePid=pid} -> "ProcRunning " <> show pid
+    ProcHalted{theProcStateExitCode=exid} -> "ProcHalted " <> show exid
+
+instance DisplayInfo ProcessConfig where { displayInfo = displayInfoShow; }
+
+
+instance DisplayInfo Process where
+  displayInfo putStr (Process mvar) = readMVar mvar >>= displayInfo putStr
+
+instance DisplayInfo ProcessState where
+  displayInfo putStr = \ case
+    ProcPending -> putStr "(pending)\n"
+    ProcRunning{theProcStatePid=pid} ->
+      mapM_ putStr ["(running, pid=", showAsText pid, ")\n"]
+    ProcHalted{theProcStateExitCode=exid} ->
+      mapM_ putStr ["(halted, ", showAsText exid, ")\n"]
 
 instance DisplayInfo ProcessLog where
   displayInfo putStr = \ case
@@ -240,272 +374,440 @@ instance DisplayInfo ProcessLog where
       forM_ (zip (iterate (+ 1) (theTextRangeStart range)) (Vec.toList vec)) $ \ (i, line) ->
         putStr $ Strict.pack $ "  " <> ralign6 i <> ": " <> show line <> "\n"
 
--- | Given a child 'Process' value, evaluate an 'EditText' function on that buffer. The buffer may
--- not exist if the child process was created by 'Inherit'-ing the current process's output or error
--- stream, or if the a file stream was created instead to capture the child process output or error
--- streams. If for either of these reasons there is no process buffer, 'TextEditUndefined' is
--- returned and the 'EditText' function is not evaluated.
-editProcessBuffer
-  :: Table.Row Process
-  -> EditText TextTags a
-  -> IO (Either EditTextError a)
-editProcessBuffer row f =
-  let (Process mvar) = Table.theRowObject row in
-  theProcCaptureBuffer <$> readMVar mvar >>= \ case
-    Nothing  -> pure $ Left TextEditUndefined
-    Just buf -> withBuffer0 buf f
+procConfigState :: Lens' ProcessConfig ProcessState
+procConfigState = lens theProcConfigState $ \ a b -> a{ theProcConfigState = b }
 
-writePipeControl :: Maybe Handle -> Maybe WritePipeControl
-writePipeControl = fmap WritePipeControl
+-- | Not for export. This function is used to translate a 'PipeSenderConfig' into a 'Exec.StdStream'
+-- for initializing a 'Exec.CreateProcess' data structure.
+pipeSenderStdStream :: PipeSenderConfig -> Exec.StdStream
+pipeSenderStdStream = \ case
+  PipeSenderConfigClose -> Exec.NoStream
+  PipeSenderConfigInherit -> Exec.Inherit
+  PipeSenderConfigPipe -> Exec.CreatePipe
+  PipeSenderConfigRedirect handle -> Exec.UseHandle handle
 
-closeWritePipe :: MonadIO io => Maybe WritePipeControl -> io ()
-closeWritePipe =
-  liftIO .
-  ( maybe (pure ()) $ \ (WritePipeControl handle) ->
-    try (hClose handle) >>= \ case
-      Left err -> seq (err :: IOException) $ pure ()
-      Right () -> pure ()
+-- | Not for export. This function is used to translate a 'PipeSenderConfig' into a 'PipeSender' for
+-- a 'ProcessState'.
+pipeSender :: Maybe Handle -> PipeSenderConfig -> PipeSender
+pipeSender procHandle = \ case
+  PipeSenderConfigClose -> PipeSender Nothing
+  PipeSenderConfigInherit -> PipeSender Nothing
+  PipeSenderConfigPipe -> PipeSender procHandle
+  PipeSenderConfigRedirect{} -> PipeSender Nothing
+    -- 'PipeSenderRedirect' returns Nothing because the handle being read by the child process is not
+    -- also supposed to be read by the parent process. You still have access to this handle from the
+    -- original 'PipeSenderConfig' but the result of this function should be a writeable handle that
+    -- can be used to write to the child process, not a handle that is to be read from. For this
+    -- reason, 'PipeSenderPipe' is the only constructor that returns the given 'procHandle', this is
+    -- the only constructor that returns a writable pipe.
+
+-- | If there are any open file 'Handle's in a given 'PipeReceiver', close them now with 'hClose'.
+closePipeReceiver :: PipeReceiver -> IO ()
+closePipeReceiver = \ case
+  PipeReceiverHandle h -> hClose h
+  PipeReceiverFile _ _ h -> hClose h
+  PipeReceiverBuffer h _ _ _ -> hClose h
+  PipeReceiverNewBufferWithFile h fh _ _ _ _ _ -> hClose h >> hClose fh
+  PipeReceiverFunction _ h _ _ -> hClose h
+  _ -> pure ()
+
+-- | Close the 'Handle' for the 'PipeSender' if it exists and is still open.
+closePipeSender :: PipeSender -> IO ()
+closePipeSender (PipeSender h) = maybe (pure ()) hClose h
+
+-- | This function is intended to be used to define a continuation for the
+-- 'PipeReceiverConfigfunction' constructor of the 'PipeReceiverConfig' data type. It constructs a
+-- function that reads line-break delimited strings from a 'Handle' and loops over it with a given
+-- continuation function. This is a more general function used that takes an arbitrary @fold@ state,
+-- and is used to define the 'bufferReceiveLines' and 'bufferReceiverLinesPut' functions which do
+-- something more specific with the 'TextLine's generated.
+receiveLineHandler
+  :: fold
+  -> (HaltReadLines fold void -> TextLine tags -> ReadLines fold ())
+  -> Handle
+  -> IO (Either EditTextError (), fold)
+receiveLineHandler fold useLine procHandle =
+  newGapBufferState Nothing hReadLineBufferSize >>= \ lineBuffer ->
+  hReadLines lineBuffer procHandle useLine fold <*
+  hClose procHandle
+
+-- | This function is intended to be used to define a continuation for the
+-- 'PipeReceiverConfigFunction' constructor of the 'PipeReceiverConfig' data type. This function is
+-- defined by passing a continuation to 'receiveLineHandler' which simply stores all received lines
+-- into a given 'Buffer', rather than passing these lines to a handler function.
+bufferReceiveLines :: Table.Row Buffer -> Handle -> IO (Either EditTextError ())
+bufferReceiveLines = fmap (fst <$>) . bufferReceiveLinesPut () (\ _ _ -> pure ())
+
+-- | This function is intended to be used to define a continuation for the
+-- 'PipeReceiverConfigfunction' constructor of the 'PipeReceiverConfig' data type. Like
+-- 'bufferReceiveLines', it is defined by passing a continuation to 'receiveLineHandler' that stores
+-- all received lines into a given 'Buffer', but also allows you to pass your own 'ReadLines'
+-- continuation which is also called for each line of text, allowing the 'TextLine' to be both
+-- buffered into the given 'Buffer' and also folded (e.g. logged to a file, or to STDOUT) by your
+-- own continuation function.
+bufferReceiveLinesPut
+  :: fold
+  -> (HaltReadLines fold void -> TextLine TextTags -> ReadLines fold ())
+  -> Table.Row Buffer
+  -> Handle
+  -> IO (Either EditTextError (), fold)
+bufferReceiveLinesPut fold put row =
+  receiveLineHandler fold
+  (\ halt line -> do
+    liftIO $ withBuffer row $ pushLine Before line
+    put halt line
   )
 
-closeReadPipe :: MonadIO io => Maybe (ReadPipeControl fold) -> io ()
-closeReadPipe = liftIO . maybe (pure ()) (hClose . thePipeHandle)
+-- | Inspect a 'PipeReceiverConfig' and return an 'Exec.StdStream' value that can be used to
+-- construct a 'PipeReceiver', either with 'connectPipeReceiver' or 'connectPipeSender'. This
+-- function attempts to open a file if a 'PipeReceiverConfigFile' or
+-- 'PipeReceiverConfigNewBufferWithFile' is given.
+pipeReceiverConfigStdStream :: PipeReceiverConfig -> IO Exec.StdStream
+pipeReceiverConfigStdStream = \ case
+  PipeReceiverConfigClose -> pure Exec.NoStream
+  PipeReceiverConfigInherit -> pure Exec.Inherit
+  PipeReceiverConfigNewBuffer -> pure Exec.CreatePipe
+  PipeReceiverConfigBuffer{} -> pure Exec.CreatePipe
+  PipeReceiverConfigFile path append ->
+    Exec.UseHandle <$>
+    openFile (Strict.unpack path) (if append then AppendMode else WriteMode)
+  PipeReceiverConfigNewBufferWithFile{} -> pure Exec.CreatePipe
+  PipeReceiverConfigFunction{} -> pure Exec.CreatePipe
+  PipeReceiverConfigHandle{ pipeControlHandle=h } -> pure $ Exec.UseHandle h
 
--- | Construct a 'PipeControl' for a particular 'Handle' that receives the output or error stream of
--- a child process. Pass a 'ReadLines' function to handle each line of input. If this 'ReadLines'
--- function throws an exception, the parent process handle is closed, which may or may not end the
--- child process. This function returns a new 'PipeControl' and an 'MVar' which will be filled when
--- the 'ReadLines' function halts. If you read this 'MVar' your thread will block until the child
--- process closes the pipe's file handle, which may not happen until the child process halts.
-newReadPipeControl
-  :: MonadIO io
-  => Maybe Handle
-  -> (HaltReadLines fold void -> TextLine tags -> ReadLines fold ())
-  -> fold
-  -> io (Maybe (ReadPipeControl fold))
-newReadPipeControl stream useLine fold = liftIO $ case stream of
-  Nothing -> pure Nothing
-  Just stream -> do
-    foldMVar <- newEmptyMVar
-    lineBuffer <- newGapBufferState Nothing hReadLineBufferSize  
-    thid <- forkIO $ do
-      result <- hReadLines lineBuffer stream useLine fold
-      hClose stream
-      putMVar foldMVar result
-    pure $ Just $
-      ReadPipeControl
-      { thePipeHandle = stream
-      , thePipeThread = thid
-      , thePipeBuffer = Nothing
-      , thePipeWaitClose = foldMVar
+-- | Evaluate a 'PipeReceiverConfig' to a readable 'Handle', from either a STDOUT or STDERR stream of
+-- a child 'Process'.
+pipeReceiver
+  :: Maybe Handle
+  -> ProcessConfig
+  -> PipeReceiverConfig
+  -> StateT ManagerEnvState IO PipeReceiver
+pipeReceiver procHandle cfg pipeControl =
+  let requirePipe f = maybe (pure PipeReceiverInherit) f procHandle
+      makeHandlerThread procHandle f = liftIO $ do
+        waitMVar <- newEmptyMVar
+        thid <- forkIO $ f procHandle >>= putMVar waitMVar -- brackets here?
+        pure (thid, waitMVar)
+      makeConnectBuffer put row procHandle =
+        makeHandlerThread procHandle $
+        (<* (hClose procHandle)) .
+        fmap fst . bufferReceiveLinesPut () put row
+  in case pipeControl of
+    PipeReceiverConfigClose -> pure PipeReceiverNothing
+    PipeReceiverConfigInherit -> pure PipeReceiverInherit
+    PipeReceiverConfigHandle h -> pure $ PipeReceiverHandle{ pipeConnectHandle = h }
+    PipeReceiverConfigFile path append -> requirePipe $ pure . PipeReceiverFile path append
+    PipeReceiverConfigBuffer row -> requirePipe $ \ procHandle -> do
+      (thid, wait) <- makeConnectBuffer (\ _ _ -> pure ()) row procHandle
+      pure PipeReceiverBuffer
+        { pipeConnectHandle = procHandle
+        , pipeConnectBuffer = row
+        , pipeConnectThread = thid
+        , pipeConnectWaitClose = wait
+        }
+    PipeReceiverConfigNewBuffer -> requirePipe $ \ procHandle -> do
+      buf <- internalNewBuffer (showAsText cfg) 63
+      (thid, wait) <- makeConnectBuffer (\ _ _ -> pure ()) buf procHandle
+      pure PipeReceiverBuffer
+        { pipeConnectHandle = procHandle
+        , pipeConnectBuffer = buf
+        , pipeConnectThread = thid
+        , pipeConnectWaitClose = wait
+        }
+    PipeReceiverConfigNewBufferWithFile path append -> requirePipe $ \ procHandle -> do
+      buf <- internalNewBuffer (showAsText cfg) 63
+      logHandle <- liftIO $
+        openFile (Strict.unpack path) (if append then AppendMode else WriteMode)
+      (this, wait) <- makeConnectBuffer
+        (const $ liftIO . Bytes.hPutStr logHandle . bytesFromString)
+        buf procHandle
+      liftIO $ hClose logHandle
+      pure PipeReceiverNewBufferWithFile
+        { pipeConnectHandle = procHandle
+        , pipeConnectFileHandle = logHandle
+        , pipeConnectFile = path
+        , pipeConnectFileAppend = append
+        , pipeConnectBuffer = buf
+        , pipeConnectThread = this
+        , pipeConnectWaitClose = wait
+        }
+    PipeReceiverConfigFunction desc f -> requirePipe $ \ procHandle -> do
+      (this, wait) <- makeHandlerThread procHandle f
+      pure PipeReceiverFunction
+        { pipeConnectDescription = desc
+        , pipeConnectHandle = procHandle
+        , pipeConnectThread = this
+        , pipeConnectWaitClose = wait
+        }
+
+-- | Create a label from a 'ProcessConfig' which is used as the label in the 'processTable' of the
+-- 'ManagerEnv'.
+processCreateLabel :: ProcessConfig -> Strict.Text
+processCreateLabel cfg =
+  Strict.unwords $
+  theProcConfigCommand cfg :
+  Vec.toList (theProcConfigArgs cfg)
+
+-- | Construct an initial 'Exec.CreateProcess' from a 'ProcessConfig'.
+processConfigCreate :: ProcessConfig -> IO Exec.CreateProcess
+processConfigCreate cfg = do
+  outHandle <- pipeReceiverConfigStdStream $ theProcConfigOutPipe cfg
+  errHandle <- pipeReceiverConfigStdStream $ theProcConfigErrPipe cfg
+  return $
+    ( Exec.proc
+      (Strict.unpack $ theProcConfigCommand cfg)
+      (Strict.unpack <$> Vec.toList (theProcConfigArgs cfg))
+    ) { Exec.std_in = pipeSenderStdStream $ theProcConfigInPipe cfg
+      , Exec.std_out = outHandle
+      , Exec.std_err = errHandle
       }
 
--- | Like 'newReadPipeControl' but simply writes all lines into the given 'Buffer'. The number of
--- lines read are sent to the 'MVar'.
-pipeToBuffer
-  :: MonadIO io
-  => Maybe Handle
-  -> RelativeDirection -- ^ incoming lines can be buffered in reverse order
-  -> Buffer
-  -> io (Maybe (ReadPipeControl Int))
-pipeToBuffer stream rel buffer =
-  newReadPipeControl stream
-  ( const $
-    liftIO . withBuffer0 buffer . pushLine rel >=> \ case
-      Left err -> readLinesLiftGapBuffer $ errorEditTextToReadLine err
-      Right () -> modify (+ 1)
-  ) 0
-
-errorEditTextToReadLine :: EditTextError -> Word8GapBuffer void
-errorEditTextToReadLine = \ case
-  EditTextError  err -> rethrowErrorInfo err
-  EditLineError  err -> rethrowErrorInfo err
-  TextEditUndefined  -> throwError $ GapBufferFail "(evaluated to 'empty')"
-  EditTextFailed msg -> throwError $ GapBufferFail msg
-  EditLineIndexError i lo hi ->
-    throwError $
-    GapBufferFail $
-    "(index " <> textShow i <>
-    " out of bounds, limits are " <> textShow lo <> ".." <> textShow hi <> ")"
-  EditCharIndexError line i lo hi ->
-    throwError $
-    GapBufferFail $
-    "(on line " <> textShow line <>
-    ": char index " <> textShow i <>
-    " out of bounds, limits are " <> textShow lo <> ".." <> textShow hi <> ")"
-
-labelCreateProcess :: CreateProcess -> Strict.Text
-labelCreateProcess mkproc =
-  case cmdspec mkproc of
-    ShellCommand path -> Strict.pack $ takeWhile (not . isSpace) $ dropWhile isSpace path
-    RawCommand path args -> Strict.unwords $ Strict.pack <$> (path : args)
-
-runProcess0 :: MonadIO io => Process -> io ()
-runProcess0 (Process mvar) =
-  liftIO $
-  modifyMVar_ mvar $ \ cfg -> do
-    (pin, pout, perr, phandle) <- createProcess $ theProcSpec cfg
-    pid <- getPid phandle
-    case pid of
-      Nothing -> do
-        this <- myThreadId
-        t0 <- getCurrentTime
-        exitCode <- waitForProcess phandle
-        t1 <- getCurrentTime
-        pure cfg
-          { theProcState = ProcHalted exitCode
-          , theProcInPipe = Nothing
-          , theProcOutPipe = Nothing
-          , theProcErrPipe = Nothing
-          , theProcWaitThread = this
-          , theProcStartTime = Just t0
-          , theProcEndTime = Just t1
-          }
-      Just pid -> do
-        let inPipe = writePipeControl pin
-        let capture pipe =
-              maybe
-              (pure Nothing)
-              (pipeToBuffer pipe Before)
-              (theProcCaptureBuffer cfg)
-        errPipe <- capture perr
-        outPipe <- capture pout
-        waitThread <- forkIO $ do
-          exitCode <- waitForProcess phandle
+-- | Not for export. Takes a 'Process' for which 'theProcConfigState' is 'ProcPending', and calls
+-- the 'Exec.createProcess' function to ask the operating system to run the child process.
+runProcess0 :: Process -> Manager (Either Strict.Text Exec.ProcessHandle)
+runProcess0 (Process mvar) = do
+  mgrst <- Manager (lift get)
+  (result, mgrst) <- liftIO $ modifyMVar mvar $ \ cfg -> case theProcConfigState cfg of
+    ProcRunning{} -> pure
+      ( cfg
+      , ( Left $ Strict.pack $ "(proc \"already running\" " <> show cfg <> ")"
+        , mgrst
+        )
+      )
+    _ -> do
+      t0 <- getCurrentTime
+      (pin, pout, perr, phandle) <- processConfigCreate cfg >>= Exec.createProcess
+      pid <- Exec.getPid phandle
+      let inPipe = pipeSender pin $ theProcConfigInPipe cfg
+      ((outPipe, errPipe), mgrst) <- flip runStateT mgrst $
+        (,) <$>
+        pipeReceiver pout cfg (theProcConfigOutPipe cfg) <*>
+        pipeReceiver perr cfg (theProcConfigOutPipe cfg)
+      let waitForEnd = do
+            exitCode <- waitForProcess phandle
+            closePipeSender inPipe
+            closePipeReceiver outPipe
+            closePipeReceiver errPipe
+            pure exitCode
+      case pid of
+        Nothing -> do
+          exitCode <- waitForEnd
           t1 <- getCurrentTime
-          closeWritePipe inPipe
-          closeReadPipe outPipe
-          closeReadPipe errPipe
-          modifyMVar_ mvar $ \ cfg -> pure $ cfg
-            { theProcState = ProcHalted exitCode
-            , theProcEndTime = Just t1
-            }
-        t0 <- getCurrentTime
-        pure cfg
-          { theProcState =
-            ProcRunning
-            { theProcStateProcHandle = phandle
-            , theProcStatePid = pid
-            }
-          , theProcInPipe = inPipe
-          , theProcOutPipe = outPipe
-          , theProcErrPipe = errPipe
-          , theProcWaitThread = waitThread
-          , theProcStartTime = Just t0
-          , theProcEndTime = Nothing
-          }
+          pure
+            ( procConfigState .~
+              ProcHalted
+              { theProcStateExitCode = exitCode
+              , theProcStartTime = t0
+              , theProcEndTime = t1
+              , theProcInPipe = inPipe
+              , theProcOutPipe = outPipe
+              , theProcErrPipe = errPipe
+              } $ cfg
+            , ( Left $ Strict.pack $ "(proc \"failed\" :exit-code " <> show exitCode <> ")"
+              , mgrst
+              )
+            )
+        Just pid -> do
+          waitThread <- forkIO $ do
+            exitCode <- waitForEnd
+            t1 <- getCurrentTime
+            modifyMVar_ mvar $ pure .
+              ( procConfigState .~
+                ProcHalted
+                { theProcStateExitCode = exitCode
+                , theProcStartTime = t0
+                , theProcEndTime = t1
+                , theProcInPipe = inPipe
+                , theProcOutPipe = outPipe
+                , theProcErrPipe = errPipe
+                }
+              )
+          pure
+            ( procConfigState .~
+              ProcRunning
+              { theProcStateProcHandle = phandle
+              , theProcStatePid = pid
+              , theProcWaitThread = waitThread
+              , theProcStartTime = t0
+              , theProcInPipe = inPipe
+              , theProcOutPipe = outPipe
+              , theProcErrPipe = errPipe
+              } $ cfg
+            , ( Right phandle
+              , mgrst
+              )
+            )
+  Manager (lift $ put mgrst)
+  pure result
 
--- | Run a particular 'Process' that has been created by 'processNewBuffer' or
--- 'processWithBuffer'. The 'Table.Row' entry is reused, so it will have the same row ID and label
--- as before, and will remain in the process table in the same position as before.
-runProcess :: MonadIO io => Table.Row Process -> io ()
-runProcess = void . runProcess0 . Table.theRowObject
+-- | Run a particular 'Process' that has been created by 'newProcess' function. If the 'Process' has
+-- been run before by 'runProcess' and has exited, the process will be re-run and the 'Table.Row'
+-- entry will be reused so that it will have the same row ID and label as before. If the 'Process'
+-- is currently running, this function returns a 'Left' error message.
+runProcess :: Table.Row Process -> Manager (Either Strict.Text Exec.ProcessHandle)
+runProcess = runProcess0 . Table.theRowObject
 
--- | not for export
---
--- Create the meta-information around a 'CreateProcess' specification that will be used by the
--- mechanisms in this module for controlling child processes.
-newProcessConfig :: MonadIO io => CreateProcess -> io ProcessConfig
-newProcessConfig exe = liftIO $ do
-  thid <- myThreadId
-  pure ProcessConfig
-    { theProcSpec = exe
-    , theProcState = ProcPending
-    , theProcInPipe = Nothing
-    , theProcOutPipe = Nothing
-    , theProcErrPipe = Nothing
-    , theProcWaitThread = thid
-    , theProcStartTime = Nothing
-    , theProcEndTime = Nothing
-    , theProcCaptureBuffer = Nothing
-    }
+-- | Create, but do not execute, a new child process specification according to a
+-- 'ProcessConfig'. The 'ProcessConfig' can be created with 'asynchronous', 'asyncCapture',
+-- 'synchronous', or by setting up your own 'ProcessConfig'. Once the @'Table.Row' 'Process'@ is
+-- returned, you can request the operating system run the child process using 'runProcess'.
+newProcess :: ProcessConfig -> Manager (Table.Row Process)
+newProcess cfg =
+  editManagerEnvTable processTable $
+  liftIO (newMVar cfg) >>= Table.insert (processCreateLabel cfg) . Process
 
--- | Given a 'CreateProcess' spec, create an external system 'Process' to be run by 'runProcess',
--- and prepare to store it's output in the process table. The 'Process' will not actually be
--- executed until 'runProcess' is called on the 'Process' handle created by this function.
---
--- If you configure an input pipe, you can dump strings to the process's standard input stream using
--- the 'processSend' function. All output from the process created if buffered in the given
--- 'Buffer'. Note that the 'CreateProcess' 'std_out' and 'std_in' fields are forced to 'CreatePipe'
--- regardless of it's value when passed to this function, this is to force the capture of the
--- process output into the given 'Buffer', and to allow input to be sent to the process, since it
--- will run asynchronously.
---
--- This function returns a 'Table.Row' because, like with 'Buffer's, any new process created has a
--- handle for it stored in a table in the 'Manager' monad execution environment so it can be retrieved
--- at any time.
-processWithBuffer :: Table.Row Buffer -> CreateProcess -> Manager (Table.Row Process)
-processWithBuffer buffer exe =
-  editManagerEnvTable processTable $ do
-    mvar <- liftIO $ do
-      cfg <- newProcessConfig (exe{ std_in = CreatePipe, std_out = CreatePipe })
-      newMVar (cfg{ theProcCaptureBuffer = Just $ Table.theRowObject buffer })
-    Table.insert (labelCreateProcess exe) $ Process mvar
+-- | Setup a new synchronous child 'Process', which will use the same 'stdin', 'stdout', and
+-- 'stderr' stream as the current process, and blocking the current process until the child process
+-- completes. So 'theProcConfigInPipe' is set to 'PipeSenderConfigInherit', and both
+-- 'theProcConfigOutPipe' and 'theProcConfigErrPipe' are set to 'PipeReceiverConfigInherit'.
+synchronous :: ProcessProgramFile -> [Strict.Text] -> ProcessConfig
+synchronous cmd args = ProcessConfig
+  { theProcConfigCommand = cmd
+  , theProcConfigArgs = Vec.fromList args
+  , theProcConfigInPipe = PipeSenderConfigInherit
+  , theProcConfigOutPipe = PipeReceiverConfigInherit
+  , theProcConfigErrPipe = PipeReceiverConfigInherit
+  , theProcConfigState = ProcPending
+  }
 
--- | Like 'processWithBuffer', but automatically creates a new 'Buffer' to capture STDOUT (and
--- STDERR is always captured, regardless of which method starts it). The 'Process' and 'Buffer'
--- handles are both returned.
-processNewBuffer :: CreateProcess -> Manager (Table.Row Buffer, Table.Row Process)
-processNewBuffer exe = do
-  buffer <- newBuffer (Strict.pack $ "STDOUT: " <> show (cmdspec exe)) 63
-  process <- processWithBuffer buffer exe
-  pure (buffer, process)
+-- | Setup a new asynchronous child 'Process', which will create two new buffers for both the
+-- 'stdout' and 'stderr' streams, and create a pipe for the 'stdin' stream to which input can be
+-- written with 'processSend'. So 'theProcConfigInPipe' is set to 'PipeSenderConfigPipe', and both
+-- 'theProcConfigOutPipe' and 'theProcConfigErrPipe' are set to 'PipeReceiverConfigNewBuffer'.
+asynchronous :: ProcessProgramFile -> [Strict.Text] -> ProcessConfig
+asynchronous cmd args =
+  (synchronous cmd args)
+  { theProcConfigInPipe = PipeSenderConfigPipe
+  , theProcConfigOutPipe = PipeReceiverConfigNewBuffer
+  , theProcConfigErrPipe = PipeReceiverConfigNewBuffer
+  }
 
--- | If the 'Process' was created with the 'std_in' field of the 'CreateProcess' spec set to
--- 'CreatePipe', a 'Handle' is available for sending input to the Process (unless the 'Process' has
--- recently closed this handle). This function allows you to send a string of input to the
--- 'Process'.
-processSend :: MonadIO io => Table.Row Process -> StringData -> io ()
-processSend row str = liftIO $
-  let (Process mvar) = Table.theRowObject row in
-  withMVar mvar $ \ cfg -> case theProcInPipe cfg of
-    Nothing -> fail $ show (Table.theRowLabel row) <> " process created without input pipe"
-    Just (WritePipeControl handle) -> case fromStringData str of
-      Nothing -> pure ()
-      Just txt -> Strict.hPutStr handle txt >> hFlush handle
+-- | Setup a new asynchronous child 'Process', which will capture both 'stdout' and 'stderr' streams
+-- into a given 'Buffer', and create a pipe for the 'stdin' stream to which input can be written
+-- with 'processSend'. So 'theProcConfigInPipe' is set to 'PipeSenderConfigPipe', and both
+-- 'theProcConfigOutPipe' and 'theProcConfigErrPipe' are set to 'PipeReceiverConfigBuffer' with the
+-- same 'Buffer' for both.
+asyncCapture :: ProcessProgramFile -> [Strict.Text] -> Table.Row Buffer -> ProcessConfig
+asyncCapture cmd args buffer =
+  (asynchronous cmd args)
+  { theProcConfigOutPipe = PipeReceiverConfigBuffer buffer
+  , theProcConfigErrPipe = PipeReceiverConfigBuffer buffer
+  }
+
+-- | Like 'asyncCapture', but automatically generates a new 'Buffer' for the 'ProcessConfig'. Also
+-- note that this needs to be evaluated in a 'Manager' function context, so that a new 'Buffer' can
+-- be created.
+asyncCaptureNewBuffer :: ProcessProgramFile -> [Strict.Text] -> Manager (Table.Row Buffer, ProcessConfig)
+asyncCaptureNewBuffer cmd args = do
+  buf <- newBuffer ("ASYNC: " <> Strict.unwords (cmd : args)) 63
+  pure (buf, asyncCapture cmd args buf)
 
 -- | Get the 'ProcessState' for a 'Process'.
 processGetState :: MonadIO io => Table.Row Process -> io ProcessState
 processGetState row = liftIO $
   let (Process mvar) = Table.theRowObject row in
-  theProcState <$> readMVar mvar
+  theProcConfigState <$> readMVar mvar
+
+-- | Not for export. Operate on a process only if 'theProcConfigState' is 'ProcRunning', throw an
+-- error otherwise.
+processRequireRunning
+  :: MonadIO io
+  => Table.Row Process
+  -> (ProcessState -> IO (Either Strict.Text a))
+  -> io (Either Strict.Text a)
+processRequireRunning row f = liftIO $
+  let (Process mvar) = Table.theRowObject row in
+  withMVar mvar $ \ cfg -> case theProcConfigState cfg of
+    st@(ProcRunning{}) -> f st
+    _ -> pure $ Left $ Strict.pack $ show (Table.theRowLabel row) <> " process not running"
+
+-- | If the 'Process' was created with the 'std_in' field of the 'CreateProcess' spec set to
+-- 'CreatePipe', a 'Handle' is available for sending input to the Process (unless the 'Process' has
+-- recently closed this handle). This function allows you to send a string of input to the
+-- 'Process'.
+processSend :: MonadIO io => Table.Row Process -> StringData -> io (Either Strict.Text ())
+processSend row str =
+  processRequireRunning row $ \ runningProc ->
+  let (PipeSender inHandle) = theProcInPipe runningProc in
+  case inHandle of
+    Nothing -> pure $ Left $ Table.theRowLabel row <> " process created without input pipe"
+    Just procHandle ->
+      Right <$>
+      case fromStringData str of
+        Nothing -> pure ()
+        Just txt -> Strict.hPutStr procHandle txt >> hFlush procHandle
 
 -- | Send a signal to the given 'Process' handle forcing it to halt. This uses
 -- 'interruptProcessGroupOf', which sends the POSIX signal @SIGINT@ ("interrupt") to the operating
 -- system process.
-processCancel :: MonadIO io => Table.Row Process -> io (Maybe ExitCode)
-processCancel = processGetState >=> liftIO . \ case
-  ProcPending -> pure Nothing
-  ProcRunning{theProcStateProcHandle=procHandle} -> do
-    interruptProcessGroupOf procHandle
-    yield
-    getProcessExitCode procHandle
-  ProcHalted{theProcStateExitCode=code} -> pure $ Just code
+processCancel :: MonadIO io => Table.Row Process -> io (Either Strict.Text ExitCode)
+processCancel row = processRequireRunning row $ \ runningProc ->
+  let procHandle = theProcStateProcHandle runningProc in
+  interruptProcessGroupOf procHandle >>
+  yield >>
+  (\ case
+    Nothing -> Left $ Strict.pack $ show (Table.theRowLabel row) <> " process not running"
+    Just procHandle -> Right procHandle
+  ) <$>
+  getProcessExitCode procHandle
 
 -- | Synchrnous wait on 'Process' completion, that is, freeze the current thread until the 'Process'
 -- completes, then return the 'ProcessState' with the 'ExitCode'. Returns 'Nothing' if the 'Process'
 -- has not started yet.
-processWait :: MonadIO io => Table.Row Process -> io (Maybe ExitCode)
-processWait = processGetState >=> liftIO . \ case
-  ProcPending -> pure Nothing
-  ProcRunning{ theProcStateProcHandle=procHandle } -> Just <$> waitForProcess procHandle
-  ProcHalted{ theProcStateExitCode=code } -> pure $ Just code
+processWait :: MonadIO io => Table.Row Process -> io (Either Strict.Text ExitCode)
+processWait row = processRequireRunning row $ fmap Right . waitForProcess . theProcStateProcHandle
+
+data GetProcessBuffer = ProcessSTDOUT | ProcessSTDERR
+  deriving (Eq, Ord, Show)
+
+evalGetProcessBuffer :: GetProcessBuffer -> ProcessState -> Maybe PipeReceiver
+evalGetProcessBuffer which st =
+  ( case which of
+      ProcessSTDOUT -> theProcOutPipe
+      ProcessSTDERR -> theProcErrPipe
+  ) <$> case st of
+    ProcPending -> Nothing
+    st -> Just st
+
+-- | Obtain a handle for a capture buffer for a particular 'Process', if there are any. The
+-- continuation passed as an argument is evaluated while the 'Process' table is locked to prevent
+-- changes to the 'Buffer' that could occur while inspecting it. Return the 'Buffer' handle
+-- immediately if you do not care to lock the 'Process' out of editing it's own capture 'Buffer'.
+processGetCaptureBuffer
+  :: MonadIO io
+  => Table.Row Process
+  -> GetProcessBuffer
+  -> (Table.Row Buffer -> IO a)
+  -> io (Either Strict.Text a)
+processGetCaptureBuffer row which f = liftIO $
+  let err msg = pure $ Left $ "process " <> Strict.pack (show $ Table.theRowLabel row) <> msg in
+  let (Process mvar) = Table.theRowObject row in
+  withMVar mvar $ \ cfg -> case evalGetProcessBuffer which $ theProcConfigState cfg of
+    Nothing -> err " not running"
+    Just pipe ->
+      let ok = Right <$> f (pipeConnectBuffer pipe) in
+      case pipe of
+        PipeReceiverBuffer{} -> ok
+        PipeReceiverNewBufferWithFile{} -> ok
+        _ -> err " has no capture buffer"
 
 -- | Obtain lines of text from the 'ProcessSTDOUT' or 'ProcessSTDERR' of a 'Process' that have been
 -- cached in a buffer.
 processGetLog
-  :: MonadIO m
+  :: MonadIO io
   => Table.Row Process
+  -> GetProcessBuffer
   -> LineIndex
   -> Maybe LineIndex
-  -> m ProcessLog
-processGetLog row fromLine toLine =
-  liftIO $
+  -> io (Either Strict.Text ProcessLog)
+processGetLog row which fromLine toLine =
+  processGetCaptureBuffer row which $ \ buf ->
   fmap
   (\ case
     Left err -> ProcessTextError err
     Right ok -> ok
   ) $
-  editProcessBuffer row $
+  withBuffer buf $
   TextRange <$>
   validateBounds fromLine <*>
   maybe maxLineIndex validateBounds toLine >>= \ range ->
@@ -537,6 +839,12 @@ newtype Manager a = Manager (ReaderT ManagerEnv (StateT ManagerEnvState IO) a)
 runManager :: Manager a -> ManagerEnv -> IO a
 runManager (Manager (ReaderT f)) env@(ManagerEnv mvar) =
   modifyMVar mvar $ fmap (\ (a,b) -> (b,a) ) . runStateT (f env)
+
+-- | Not for export
+--
+-- Lift a function of type @('StateT' 'ManagerEnvState' IO a)@ into a 'Manager' function type.
+managerState :: StateT ManagerEnvState IO a -> Manager a
+managerState = Manager . lift
 
 -- | Values of this type maintain mutable data in an execution environment for evaluating functions
 -- of type 'Manager', it contains tables of elements that should not be lost even if their handles go
@@ -692,8 +1000,11 @@ clearWorker worker =
 -- the 'ManagerEnv' execution environment, which is why it returns a 'Table.Row'. This is so if you
 -- lose the handle to it while working in GHCI, you can get it back using 'getBuffer'.
 newBuffer :: Table.Label -> VectorSize -> Manager (Table.Row Buffer)
-newBuffer label initSize =
-  editManagerEnvTable bufferTable $
+newBuffer = (managerState .) . internalNewBuffer
+
+internalNewBuffer :: Table.Label -> VectorSize -> StateT ManagerEnvState IO (Table.Row Buffer)
+internalNewBuffer label initSize =
+  Table.withinGroup bufferTable $
   ( liftIO $
     newEditTextState initSize >>= \ ed ->
     fmap Buffer $

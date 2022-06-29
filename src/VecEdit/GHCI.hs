@@ -7,13 +7,14 @@ module VecEdit.GHCI
   ( main,
     -- ** Data Buffers
     Manager.Buffer, Manager.bufferTable, newBuffer, bufferPrintAll, bufferHandle, bufferFile,
-    Manager.withBufferPath, Manager.bufferShow,
+    Manager.withBufferPath, Manager.bufferShow, withBuffer,
     -- ** Worker Threads
     Manager.Worker, Manager.workerTable, workerPrintAll, startWork, Manager.workerGetStatus,
     -- ** Child Processes
-    Manager.Process, Manager.processTable, processPrintAll, runInBuffer, withBuffer,
-    Manager.runProcess, Manager.pipeToBuffer, Manager.newReadPipeControl, Manager.processSend,
-    Manager.processWait, Manager.processGetLog, Manager.processGetState,
+    Manager.Process, Manager.processTable, processPrintAll, newProcess, runProcess,
+    Manager.synchronous, Manager.asynchronous, Manager.asyncCapture,
+    Manager.asyncCaptureNewBuffer,
+    Manager.processSend, Manager.processWait, Manager.processGetLog,
     -- ** Lifting 'Manager' functions
     ManagerEnv, Manager, ioManager,
     -- ** Testing
@@ -74,7 +75,7 @@ import qualified Data.Vector.Mutable as MVec
 
 import System.IO (Handle, IOMode(ReadMode), openFile, hClose)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Process (CreateProcess)
+import qualified System.Process as Exec
 
 ----------------------------------------------------------------------------------------------------
 
@@ -135,7 +136,7 @@ workerPrintAll = ioManager Manager.workerPrintAll
 processPrintAll :: IO ()
 processPrintAll = ioManager Manager.processPrintAll
 
--- | Run an external system process from a 'CreateProcess' spec, store it's output in the process
+-- | Define an external system process that can be run with 'runProcess', store it into the process
 -- table. If you configure an input pipe, you can dump strings to the process's standard input
 -- stream using the 'sendToProc' function. All output from the process created if buffered in the
 -- given 'Buffer'. Note that the 'CreateProcess' 'std_out' and 'std_in' fields are forced to
@@ -146,8 +147,13 @@ processPrintAll = ioManager Manager.processPrintAll
 -- This function returns a 'Table.Row' because, like with 'Buffer's, any new process created has a
 -- handle for it stored in a table in the 'Manager' monad execution environment so it can be retrieved
 -- at any time.
-runInBuffer :: Table.Row Manager.Buffer -> CreateProcess -> IO (Table.Row Manager.Process)
-runInBuffer = fmap (fmap ioManager) Manager.processWithBuffer
+newProcess :: Manager.ProcessConfig -> IO (Table.Row Manager.Process)
+newProcess = ioManager . Manager.newProcess
+
+-- | After creating a new 'Process' with 'newProcess', you can ask the operating system to actually
+-- run the process with this function, which starts a job.
+runProcess :: Table.Row Manager.Process -> IO (Either Strict.Text Exec.ProcessHandle)
+runProcess = ioManager . Manager.runProcess
 
 ----------------------------------------------------------------------------------------------------
 
