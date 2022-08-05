@@ -18,6 +18,7 @@ import VecEdit.Vector.Editor.GapBuffer
 import VecEdit.Text.String
   ( TextLine, hReadLines, isAsciiOnly, readLinesLiftGapBuffer,
     streamByteString, byteStreamToLines, cutUTF8TextLine,
+    StringData, toStringData, convertString
   )
 import VecEdit.Text.Editor
   ( newEditTextState, evalEditText,
@@ -27,20 +28,32 @@ import VecEdit.Text.Editor
 import VecEdit.Jobs (Manager, Buffer, withBuffer, newBuffer, bufferShow)
 import qualified VecEdit.Table as Table
 
-import VecEdit.Text.TokenizerTable (tokTableFold)
+import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoPrint, displayInfoShow)
 import VecEdit.Text.LineBreak (allLineBreaks, allLineBreaks, lineBreak_LF)
+import VecEdit.Text.Parser
+       ( StringParser, StringParserState, StringParserResult(ParseOK),
+         runStringParser, resumeStringParser, stringParserState,
+         parserString, parserIndex, parserLineIndex, parserIsEOF,
+       )
+import VecEdit.Text.TokenizerTable (tokTableFold)
 
-import Control.Lens (use, (.=), (+=))
+import Control.Applicative ((<|>), some)
+import Control.Lens (use, (.=), (+=), (.~), (+~))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.State (MonadState(..))
 
 import qualified Data.ByteString.UTF8 as UTF8
+import Data.Char (isSpace, isDigit)
 import qualified Data.Vector as Vec
+import Data.Vector (Vector)
 import Data.Vector.Mutable (MVector, IOVector)
-import qualified Data.Vector.Mutable as MVec
 import qualified Data.Text as Strict
 import qualified Data.Text.IO as Strict
+import qualified Data.Vector.Mutable as MVec
+
+import Text.Parser.Char (satisfy, char, spaces, oneOf, anyChar)
+import Text.Parser.Combinators (many, manyTill, choice, (<?>))
 
 import System.IO (IOMode(ReadMode), openFile, hClose)
 
@@ -271,7 +284,7 @@ testByteStreamToLines = do
   --
   -- Test 'byteStreamToLines' on a file via the 'hReadLines' function.
   buf <- newGapBufferState (Just 0) 128
-  h <- openFile "./VecEdit-jobs.cabal" ReadMode
+  h <- openFile "./emacs-hacker.cabal" ReadMode
   flip (hReadLines buf h) (1::Int) $ \ _halt line -> do
     i <- get
     liftIO $ putStrLn $ show i <> ": " <> show (line :: TextLine ())
@@ -280,12 +293,141 @@ testByteStreamToLines = do
 
 ----------------------------------------------------------------------------------------------------
 
+data SExpr
+  = StringLit !StringData
+  | CharLit !StringData
+  | NumberLit !StringData
+  | Keyword !StringData
+  | SymLit !StringData
+  | Quote !SExpr
+  | Backquote !SExpr
+  | Hashed !SExpr
+  | Form !(Vector SExpr)
+  deriving Eq
+
+instance Show SExpr where
+  show = \ case
+    StringLit str -> convertString str
+    CharLit   str -> '?' : convertString str
+    NumberLit str -> convertString str
+    Keyword   str -> convertString str
+    SymLit    str -> convertString str
+    Quote     str -> '\'' : show str
+    Backquote str -> '`' : show str
+    Hashed    str -> '#' : show str
+    Form      str -> '(' : unwords (show <$> Vec.toList str) <> ")"
+
+instance DisplayInfo SExpr where
+  displayInfo = displayInfoShow
+
+closeOf :: Char -> Char
+closeOf = \ case
+  '(' -> ')'
+  '[' -> ']'
+  '{' -> '}'
+  c   -> c
+
+sexpr :: StringParser StringData IO SExpr
+sexpr =
+  let makestr = toStringData . Just in
+  choice
+  [ ( oneOf "([{" >>= \ bracket -> pure ("}])"::String) >>
+      Form . Vec.fromList <$> (many (spaces >> sexpr) <* char (closeOf bracket))
+    ) <?> "form"
+  , ( char '?' >>
+      CharLit . makestr <$>
+      ( ((\ a b -> a:b:"") <$> char '\\' <*> oneOf "abfnrtv") <|>
+        ((:"") <$> anyChar)
+      )
+    ) <?> "character literal"
+  , ( char '"' >>
+      StringLit . makestr . ("\"" <>) . (<> "\"") . join <$>
+      manyTill
+      ( many (satisfy (\ c -> c /= '\\' && c /= '"')) >>= \ str ->
+        ((char '\\' >> pure (str <> "\\")) <|> pure str)
+      )
+      (char '"')
+    ) <?> "string literal"
+  , ( Keyword . makestr <$>
+      ((:) <$> char ':' <*> some (satisfy (not . isSpace)))
+    ) <?> "keyword"
+  , ( NumberLit . makestr <$>
+      ( ((:"") <$> oneOf "+-" <|> pure "") >>= \ sign ->
+        some (satisfy isDigit) >>= \ num ->
+        ((:) <$> char '.' <*> some (satisfy isDigit) <|> pure "") >>= \ decpoint ->
+        ( (:) <$> oneOf "eE" <*>
+          ((<>) <$> ((:"") <$> oneOf "+-" <|> pure "") <*> some (satisfy isDigit)) <|>
+          pure ""
+        ) >>= \ pow ->
+        pure (sign <> num <> decpoint <> pow)
+      )
+    ) <?> "number literal"
+  , char '\'' >> (Quote <$> sexpr <?> "quoted s-expression")
+  , char '`' >> (Backquote <$> sexpr <?> "backquoted s-expression")
+  , char '#' >> (Hashed <$> sexpr <?> "hashed s-expression")
+  , SymLit . makestr <$>
+    some (satisfy (\ c -> not $ isSpace c || elem c ("([{'`\"#?:;}])"::String))) <?>
+    "symbol literal"
+  ] <?> "s-expression"
+
+parseTest
+  :: (Show str, Show a)
+  => StringParser str IO a
+  -> StringParserState str
+  -> IO (StringParserResult str IO a, StringParserState str)
+parseTest p st = do
+  (result, st) <- runStringParser p st
+  displayInfoPrint st
+  print result
+  putStrLn ""
+  pure (result, st)
+
+parseStep
+  :: (Show str, Show a)
+  => StringParserResult str IO a
+  -> StringParserState str
+  -> IO (StringParserResult str IO a, StringParserState str)
+parseStep p st = do
+  (result, st) <- resumeStringParser p st
+  displayInfoPrint st
+  print result
+  putStrLn ""
+  pure (result, st)
+
+newParse :: String -> StringParserState StringData
+newParse = stringParserState . convertString
+
+feedLine :: Bool -> String -> StringParserState StringData -> StringParserState StringData
+feedLine eof line =
+  (parserIsEOF .~ eof) .
+  (parserString .~ convertString line) .
+  (parserLineIndex +~ 1) .
+  (parserIndex .~ 0)
+
+testStringParser :: IO ()
+testStringParser = do
+  (a, st) <- parseTest sexpr $ newParse "(print \"Hello, world!\\n\"\n"
+  (ParseOK a, _) <- parseStep a $ feedLine True "  :i 1.5432e-3 :j 950)\n" st
+  let expect = Form $ Vec.fromList
+        [ SymLit "print"
+        , StringLit "\"Hello, world!\\n\""
+        , Keyword ":i"
+        , NumberLit "1.5432e-3"
+        , Keyword ":j"
+        , NumberLit "950"
+        ]
+  if a == expect then pure () else
+    error $ "expected: " <> show expect <> "\nparsed: " <> show a
+
+----------------------------------------------------------------------------------------------------
+
 -- | Run all tests.
 main :: IO ()
 main =
+  testStringParser >>
   newEditTextState 128 >>=
   ( evalEditText $
-    liftIO (openFile "./VecEdit-jobs.cabal" ReadMode) >>=
+    liftIO (openFile "./emacs-hacker.cabal" ReadMode) >>=
     loadHandleEditText Nothing >>
     (do cursorToEnd Before
         flip (foldLinesFromCursor After) (1::Int) $ \ _halt i line -> do
