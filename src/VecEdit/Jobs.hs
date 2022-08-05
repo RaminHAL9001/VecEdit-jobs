@@ -28,16 +28,19 @@ module VecEdit.Jobs
     -- process. You can also define your own continuation for receiving raw strings from the output
     -- and error streams via an IO 'Handle'. Once a process is created and in the process table, it
     -- can be run as a job.
-    ProcessConfig(..), ProcessProgramFile,
+    ProcessConfig(..), ProcessProgramFile, ProcessState,
+    procConfigCommand, procConfigArgs,
+
+    -- *** Configuring how data is sent to and received from a child process.
     PipeSenderConfig(..), PipeReceiverConfig(..),
-    synchronous, asynchronous, asyncCapture, asyncCaptureNewBuffer,
+    synchronous, asynchronous, asyncCapture, asyncCaptureNewBuffer, asyncLineFilter,
 
     -- *** Custom 'PipeReceiverConfigFunction' configurations
-    bufferReceiveLines, bufferReceiveLinesPut,
+    bufferReceiveLines, bufferReceiveLinesPut, receiveLineHandler,
     
     -- *** Running a 'Process' as a job
     Process, newProcess, runProcess,
-    processPrintAll, processList,
+    processPrintAll, processList, processFindById,
     processSend, processGetState, processWait, processCancel,
     processGetCaptureBuffer,
     GetProcessBuffer(..), ProcessLog(..), processGetLog,
@@ -70,12 +73,12 @@ import VecEdit.Table (Table)
 import Control.Concurrent (ThreadId, forkIO, yield)
 import Control.Concurrent.MVar
        (MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_, takeMVar, putMVar, withMVar)
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, evaluate)
 import Control.Lens (Lens', lens, use, (^.), (.~), (%=), (.=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Reader (MonadReader, ask, ReaderT(..))
-import Control.Monad.State (StateT(..), MonadState(..), runStateT)
+import Control.Monad.State (StateT(..), MonadState(..), runStateT, execStateT)
 import Control.Monad.Trans (lift)
 
 import qualified Data.ByteString as Bytes
@@ -169,6 +172,11 @@ workerGetStatus = liftIO . readMVar . theWorkerStatus
 -- the process exit code, and retrieve any output from the process that was captured in a buffer.
 newtype Process = Process (MVar ProcessConfig)
 
+-- | Configure how a child process is to be launched and how IO to and from this child process
+-- should be controlled. Use functions such as 'synchronous', 'asynchronous', 'asyncCapture',
+-- 'asyncCaptureNewBuffer', or 'asyncLineFilter' to setup the IO for the process, and then set
+-- 'theProcConfigCommand' and 'theProcConfigArgs' on the value returned by one of the above
+-- mentioned functions.
 data ProcessConfig
   = ProcessConfig
     { theProcConfigCommand :: !ProcessProgramFile
@@ -178,6 +186,12 @@ data ProcessConfig
     , theProcConfigErrPipe :: !PipeReceiverConfig
     , theProcConfigState :: !ProcessState
     }
+
+procConfigCommand :: Lens' ProcessConfig ProcessProgramFile
+procConfigCommand = lens theProcConfigCommand $ \ a b -> a{ theProcConfigCommand = b }
+
+procConfigArgs :: Lens' ProcessConfig (Vector Strict.Text)
+procConfigArgs = lens theProcConfigArgs $ \ a b -> a{ theProcConfigArgs = b }
 
 -- | When a function takes an argument of this type, the given 'Strict.Text' string must be a path
 -- to an executable program file somewhere in the file system.
@@ -197,7 +211,10 @@ data PipeSenderConfig
 newtype PipeSender = PipeSender (Maybe Handle)
 
 -- | This data type is part of a 'ProcessConfig' controlling how the STDOUT and STDERR streams of a
--- process will be used.
+-- process will be used. These are primitive functions that can setup any kind of IO between this
+-- process and the child process, it is better to use less primitive functions such as
+-- 'asynchronous', 'asyncCapture', 'asyncCaptureNewBuffer', or 'asyncLineFilter' rather than try to
+-- set 'theProcConfigOutPipe' and 'theProcConfigErrPipe' directly using one of these primitives.
 data PipeReceiverConfig
   = PipeReceiverConfigClose -- ^ Close the stream after forking the child process.
   | PipeReceiverConfigInherit -- ^ Inherit the pipe from the current process
@@ -238,7 +255,6 @@ data PipeReceiver
   | PipeReceiverFile
     { pipeConnectFile :: !Strict.Text
     , pipeConnectFileAppend :: !Bool
-      -- ^ Only relevant for receiver pipes. This is ignored for sender pipes.
     , pipeConnectHandle :: !Handle
     }
   | PipeReceiverBuffer
@@ -252,7 +268,6 @@ data PipeReceiver
     , pipeConnectFileHandle :: !Handle
     , pipeConnectFile :: !Strict.Text
     , pipeConnectFileAppend :: !Bool
-      -- ^ Only relevant for receiver pipes. This is ignored for sender pipes.
     , pipeConnectBuffer :: !(Table.Row Buffer)
     , pipeConnectThread :: !ThreadId
     , pipeConnectWaitClose :: !(MVar (Either EditTextError ()))
@@ -262,8 +277,8 @@ data PipeReceiver
     , pipeConnectHandle :: !Handle
     , pipeConnectThread :: !ThreadId
     , pipeConnectWaitClose :: !(MVar (Either EditTextError ()))
-    } -- ^ For all other stream receiver/sender mechanisms that are not handled by the other
-      -- constructors of this data type, you can define your own with this constructor.
+    } -- ^ For all other stream receiver mechanisms that are not handled by the other constructors
+      -- of this data type, you can define your own with this constructor.
 
 -- | Describes what state a 'Process' is in.
 data ProcessState
@@ -699,8 +714,42 @@ asyncCapture cmd args buffer =
 -- be created.
 asyncCaptureNewBuffer :: ProcessProgramFile -> [Strict.Text] -> Manager (Table.Row Buffer, ProcessConfig)
 asyncCaptureNewBuffer cmd args = do
-  buf <- newBuffer ("ASYNC: " <> Strict.unwords (cmd : args)) 63
+  buf <- newBuffer (Strict.unwords $ "ASYNC:" : (showAsText <$> (cmd : args))) 63
   pure (buf, asyncCapture cmd args buf)
+
+-- | Setup a new asynchronous child 'Process' which will capture the 'stderr' stream to an in-memory
+-- 'Buffer' created just for this process, and will capture the 'stdin' stream, receiving each line
+-- of characters that the child process outputs and feeding it to the given filter function. The
+-- filter function uses the 'StateT' monad transformer to build up some state as it filters lines of
+-- input. This state must be stored in an 'MVar' because it is updated in a separate thread, the
+-- same thread that listens for characters on the STDOUT stream of the child process.
+--
+-- ___NOTE:___ that the given 'MVar' is read only once during filtering, every time the filter
+-- updates it's @fold@ state, the 'MVar' is written, overwriting whatever was there before. This
+-- guarantees that information cannot be introduced into the @fold@ value outside of the filter
+-- continuation function you pass as the argument. You may evaluate 'readMVar' on the 'MVar' at any
+-- time and retrieve the most up-to-date version of the @fold@ value, but the 'modifyMVar' and
+-- 'swapMVar' functions do nothing. __NEVER__ evaluate 'takeMVar' on the 'MVar'.
+asyncLineFilter
+  :: ProcessProgramFile
+  -> [Strict.Text]
+  -> MVar fold
+  -> (TextLine TextTags -> StateT fold IO ())
+  -> ProcessConfig
+asyncLineFilter cmd args mvar filter =
+  (asynchronous cmd args)
+  { theProcConfigOutPipe =
+    PipeReceiverConfigFunction
+    (Strict.unwords $ "FILTER:" : (showAsText <$> (cmd:args)))
+    (\ handle -> do
+      init <- readMVar mvar
+      (result, fold) <-
+        flip (receiveLineHandler init) handle $ \ _halt line ->
+        get >>= liftIO . (execStateT (filter line) >=> evaluate) >>= put >>
+        get >>= liftIO . modifyMVar_ mvar . const . pure
+      modifyMVar mvar $ const $ pure (fold, result)
+    )
+  }
 
 -- | Get the 'ProcessState' for a 'Process'.
 processGetState :: MonadIO io => Table.Row Process -> io ProcessState
@@ -756,6 +805,13 @@ processCancel row = processRequireRunning row $ \ runningProc ->
 -- has not started yet.
 processWait :: MonadIO io => Table.Row Process -> io (Either Strict.Text ExitCode)
 processWait row = processRequireRunning row $ fmap Right . waitForProcess . theProcStateProcHandle
+
+-- | Find a process by it's integer ID. When a 'Process' is created by 'newProcess', 'synchronous',
+-- 'asynchronous', or any other such function, a reference to the process is stored in the current
+-- process 'Manager's global state. You can list this 'Process' table with 'processList', and you
+-- can use any of the ID numbers displayed to select a particular process using this function.
+processFindById :: Int -> Manager (Maybe (Table.Row Process))
+processFindById i = editManagerEnvTable processTable $ Table.select1 (Table.byRowId i)
 
 data GetProcessBuffer = ProcessSTDOUT | ProcessSTDERR
   deriving (Eq, Ord, Show)
