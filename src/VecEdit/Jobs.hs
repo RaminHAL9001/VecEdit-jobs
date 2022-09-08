@@ -7,7 +7,7 @@ module VecEdit.Jobs
     ManagerEnvState, bufferTable, workerTable, processTable,
 
     -- ** Text 'Buffer's
-    Buffer, TextTags, newBuffer,
+    Buffer, TextTags, newBuffer, newBufferSized,
     bufferPrintAll, bufferList, bufferHandle, bufferFile, bufferFileInto, bufferShow,
     withBuffer, withBufferPath,
 
@@ -30,13 +30,14 @@ module VecEdit.Jobs
     -- can be run as a job.
     ProcessConfig(..), ProcessProgramFile, ProcessState,
     procConfigCommand, procConfigArgs,
+    ControlThreadErrorConfig(..), PipeControlInitializer,
 
     -- *** Configuring how data is sent to and received from a child process.
     PipeSenderConfig(..), PipeReceiverConfig(..),
     synchronous, asynchronous, asyncCapture, asyncCaptureNewBuffer, asyncLineFilter,
 
     -- *** Custom 'PipeReceiverConfigFunction' configurations
-    bufferReceiveLines, bufferReceiveLinesPut, receiveLineHandler,
+    pipeBufferLines, pipeMapLines, pipeFoldLines, pipeMapBufferLines, pipeFoldBufferLines,
     
     -- *** Running a 'Process' as a job
     Process, newProcess, runProcess,
@@ -50,21 +51,24 @@ module VecEdit.Jobs
   ) where
 
 import VecEdit.Types
-  ( VectorSize, RelativeDirection(..), TextRange(..), LineIndex(..),
-    EditTextError(..),
+  ( RelativeDirection(..), TextRange(..), LineIndex(..),
+    LineBufferSize, CharBufferSize, EditTextError(..),
   )
 
 import VecEdit.Vector.Editor ( ralign6 )
-import VecEdit.Vector.Editor.GapBuffer (newGapBufferState)
 import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoShow, showAsText)
+import VecEdit.Text.LineBreak (LineBreakSymbol)
 import VecEdit.Text.String
-  ( TextLine, ReadLines, HaltReadLines, StringData,
-    fromStringData, bytesFromString, hReadLines, hReadLineBufferSize,
-    convertString, theTextLineData,
+  ( TextLine, StringData, textLineString, textLineBreakSymbol,
+    LineEditor(..), EditLine,
+    newEditLineState, lineBreak,
+    ReadLines, HaltReadLines,
+    newReadLinesState, readLinesState,
+    fromStringData, hFoldLines, streamEditor,
   )
 import VecEdit.Text.Editor
-  ( EditText, EditTextState, loadHandleEditText, loadHandleEditText,
-    newEditTextState, runEditText, pushLine, foldLinesInRange,
+  ( EditText, EditTextState,
+    newEditTextState, runEditText, foldLinesInRange,
     maxLineIndex, validateBounds, mapRangeFreeze,
   )
 import qualified VecEdit.Table as Table
@@ -73,7 +77,7 @@ import VecEdit.Table (Table)
 import Control.Concurrent (ThreadId, forkIO, yield)
 import Control.Concurrent.MVar
        (MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_, takeMVar, putMVar, withMVar)
-import Control.Exception (SomeException, catch, evaluate)
+import Control.Exception (SomeException, catch)
 import Control.Lens (Lens', lens, use, (^.), (.~), (%=), (.=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
@@ -81,7 +85,7 @@ import Control.Monad.Reader (MonadReader, ask, ReaderT(..))
 import Control.Monad.State (StateT(..), MonadState(..), runStateT, execStateT)
 import Control.Monad.Trans (lift)
 
-import qualified Data.ByteString as Bytes
+import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Function (on)
 import qualified Data.Text as Strict
 import qualified Data.Text.IO as Strict
@@ -89,7 +93,7 @@ import Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Data.Vector as Vec
 import Data.Vector (Vector)
 
-import System.IO (Handle, IOMode(..), openFile, hClose, hFlush)
+import System.IO (Handle, IOMode(..), openFile, hClose, hFlush, hPutStr, hPutStrLn, stderr)
 import qualified System.Process as Exec
 import System.Process
        ( ProcessHandle,
@@ -218,31 +222,90 @@ newtype PipeSender = PipeSender (Maybe Handle)
 data PipeReceiverConfig
   = PipeReceiverConfigClose -- ^ Close the stream after forking the child process.
   | PipeReceiverConfigInherit -- ^ Inherit the pipe from the current process
-  | PipeReceiverConfigNewBuffer -- ^ Launch a thread to capture the 'Handle' into a newly created 'Buffer'.
+  | PipeReceiverConfigNewBuffer
+    { pipeControlOnError :: !ControlThreadErrorConfig
+    } -- ^ Launch a thread to capture the 'Handle' into a newly created 'Buffer'.
   | PipeReceiverConfigBuffer
     { pipeControlBuffer :: !(Table.Row Buffer)
-    }  -- ^ Launch a thread to capture the 'Handle' into a 'Buffer'.
+    , pipeControlOnError :: !ControlThreadErrorConfig
+    }  -- ^ Launch a thread to capture the 'Handle' into the given 'Buffer'.
   | PipeReceiverConfigHandle
     { pipeControlHandle :: !Handle
-    } -- ^ Redirect to an already-open 'Handle'
+    } -- ^ Redirect to an already-open 'Handle'. Redirection of bytes in the stream is controlled by
+      -- the OS, no thread is created to do this.
   | PipeReceiverConfigFile
     { pipeControlFile :: !Strict.Text
     , pipeControlAppend :: !Bool
       -- ^ 'True' -> 'AppendMode', 'False' -> 'WriteMode' (truncate)
-    } -- ^ Redirect to a 'Handle' by opening the given file path.
+    } -- ^ Redirect to a 'Handle' by opening the given file path. Redirection of bytes in the stream
+      -- is controlled by the OS, no thread is created to do this.
   | PipeReceiverConfigNewBufferWithFile
     { pipeControlFile :: !Strict.Text
+    , pipeControlOnError :: !ControlThreadErrorConfig
     , pipeControlAppend :: !Bool
       -- ^ 'True' -> 'AppendMode', 'False' -> 'WriteMode' (truncate)
     } -- ^ Launch a thread to capture the 'Handle' into a 'Buffer', but also write captured output
       -- to a file.
   | PipeReceiverConfigFunction
     { pipeControlDescription :: !Strict.Text
-    , pipeControlFunction :: !(Handle -> IO (Either EditTextError ()))
+    , pipeControlOnError :: !ControlThreadErrorConfig
+    , pipeControlFunction :: PipeControlInitializer
     } -- ^ Launch a thread to read or write the 'Handle'. Provide a descriptive string, otherwise
      -- what this function actually does with the 'Handle' is completely opaque. For all other
      -- stream receiver/sender mechanisms that are not handled by the other constructors of this
-     -- data type, you can define your own with this constructor.
+     -- data type, you can define your own with this constructor. You can of course also create a
+     -- text buffer a evaluate a 'ReadLines' loop on the 'Handle', if you do not like the way
+     -- 'PipeReceiverConfigBuffer' does it.
+
+-- | Functions of this type are initialzers for a function that reads bytes from a file
+-- 'Handle'. When creating a control thread for reading bytes that are from the pipe of a child
+-- process, this function is evaluated first thing when the control thread is forked. This function
+-- can setup whatever state is necessary (e.g. creating new 'IORef's). As long as this state is
+-- private to the closure it is guaranteed to be accessible only to a single thread. The returned
+-- closure is used as a continuation, and is passed the pipe 'Handle', where the closure can begin
+-- looping over reading bytes from the 'Handle'.
+-- 
+-- Functions of this type are usually used to define a 'PipeReceiverConfigFunction' for the
+-- 'theProcConfigOutPipe' or 'theProcConfigErrPipe' of a 'ProcessConfig'. The
+-- 'PipeControlInitializer' will usually setup a loop over the pipe 'Handle' to receive the byte
+-- stream from a child process, and break the byte stream up into 'TextLine's. The 'pipeFoldLines',
+-- 'pipeMapLines', 'pipeBufferLines', and 'pipeFoldBufferLines' are all initializers of this
+-- function type.
+type PipeControlInitializer = IO (Handle -> IO (Either EditTextError ()))
+
+-- | When a child process is launched, local threads are also launched to recieve information that
+-- the child process emits on it's 'stdout' and 'stderr' channels. These threads run computations
+-- that typically inspect the byte stream and buffer the bytes. These computations may fail,
+-- however, and if a thread that was controlling the child process output fails, a decision must be
+-- made as to what should be done.
+data ControlThreadErrorConfig
+  = CtrlErrIgnore
+    -- ^ ignore the error entirely. This may hang the child process.
+  | CtrlErrPrint
+    -- ^ ignore the error, but print it to the local 'stderr' and log it in any local error
+    -- buffer. This may hang the child process.
+  | CtrlErrRelaunch !Int
+    -- ^ Launch a new thread with a re-intitialized capture buffer and attempt to resume reading
+    -- from the child process. The function @IO (Handle -> IO (Either EditTextError ()))@ should
+    -- re-initialize a function for reading the byte stream.
+  | CtrlErrSIGABRT
+    -- ^ Send a 'SIGABRT' signal to the child process.
+  | CtrlErrSIGKILL
+    -- ^ Send a 'SIGKILL' signal to the child process.
+  | CtrlErrClosePipe
+    -- ^ Call 'hClose' on the child's STDOUT and/or STDERR stream. This will usually cause the OS to
+    -- send a 'SIGPIPE' signal to the child process, which usually causes the child process to die.
+
+instance Show ControlThreadErrorConfig where
+  show = \ case
+    CtrlErrIgnore -> "#'ignore"
+    CtrlErrPrint -> "#'print"
+    CtrlErrRelaunch i -> "(relaunch " <> show i <> ")"
+    CtrlErrSIGABRT -> "(signal 'ABRT)"
+    CtrlErrSIGKILL -> "(signal 'KILL)"
+    CtrlErrClosePipe -> "#'close-pipe"
+
+instance DisplayInfo ControlThreadErrorConfig where { displayInfo = displayInfoShow; }
 
 -- | This data type is a part of a 'ProcessState' for a 'ProcRunning' (running process). It contains
 -- information necessary to enact the 'PipeReceiverConfig' semantics for both STDOUT and STDERR
@@ -328,13 +391,19 @@ instance Show PipeReceiverConfig where
   show = \ case
     PipeReceiverConfigClose -> "(close)"
     PipeReceiverConfigInherit -> "(inherit)"
-    PipeReceiverConfigNewBuffer -> "(capture-new-buffer)"
-    PipeReceiverConfigBuffer buf -> "(capture-buffer " <> show (Table.theRowLabel buf) <> ")"
+    PipeReceiverConfigNewBuffer onErr ->
+      "(capture-new-buffer :on-error " <> show onErr <> ")"
+    PipeReceiverConfigBuffer buf onErr ->
+      "(capture-buffer " <> show (Table.theRowLabel buf) <>
+      " :on-error " <> show onErr <> ")"
     PipeReceiverConfigHandle _ -> "(file-handle)"
     PipeReceiverConfigFile file _ -> "(file " <> show file <> ")"
-    PipeReceiverConfigNewBufferWithFile file append ->
-      "(capture-buffer " <> show file <> (if append then ":append-mode" else "") <> ")"
-    PipeReceiverConfigFunction desc _ -> "(capturing " <> show desc <> ")"
+    PipeReceiverConfigNewBufferWithFile file onErr append ->
+      "(capture-buffer " <> show file <>
+      (if append then ":append-mode" else "") <>
+      " :on-error " <> show onErr <> ")"
+    PipeReceiverConfigFunction desc onErr _ ->
+      "(capturing " <> show desc <> " :on-error " <> show onErr <> ")"
 
 instance Show PipeReceiver where
   show = \ case
@@ -430,58 +499,136 @@ closePipeReceiver = \ case
 closePipeSender :: PipeSender -> IO ()
 closePipeSender (PipeSender h) = maybe (pure ()) hClose h
 
--- | This function is intended to be used to define a continuation for the
--- 'PipeReceiverConfigfunction' constructor of the 'PipeReceiverConfig' data type. It constructs a
--- function that reads line-break delimited strings from a 'Handle' and loops over it with a given
--- continuation function. This is a more general function used that takes an arbitrary @fold@ state,
--- and is used to define the 'bufferReceiveLines' and 'bufferReceiverLinesPut' functions which do
--- something more specific with the 'TextLine's generated.
-receiveLineHandler
-  :: fold
-  -> (HaltReadLines fold void -> TextLine tags -> ReadLines fold ())
-  -> Handle
-  -> IO (Either EditTextError (), fold)
-receiveLineHandler fold useLine procHandle =
-  newGapBufferState Nothing hReadLineBufferSize >>= \ lineBuffer ->
-  hReadLines lineBuffer procHandle useLine fold <*
-  hClose procHandle
+-- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
+-- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received inserted into
+-- the given 'Buffer' at that buffer's current cursor position.
+--
+-- This function is used when you setup a 'PipeReceiverConfig' using either of the
+-- 'PipeReceiverConfigNewBuffer' or 'PipeReceiverConfigBuffer' constructors.
+pipeBufferLines :: Table.Row Buffer -> PipeControlInitializer
+pipeBufferLines row = pipeMapBufferLines row (\ _ _ -> pure ())
 
--- | This function is intended to be used to define a continuation for the
--- 'PipeReceiverConfigFunction' constructor of the 'PipeReceiverConfig' data type. This function is
--- defined by passing a continuation to 'receiveLineHandler' which simply stores all received lines
--- into a given 'Buffer', rather than passing these lines to a handler function.
-bufferReceiveLines :: Table.Row Buffer -> Handle -> IO (Either EditTextError ())
-bufferReceiveLines = fmap (fst <$>) . bufferReceiveLinesPut () (\ _ _ -> pure ())
+-- | Used to define 'pipeFoldLines' and 'pipeMapLines' __without__ a backing 'TextBuffer'. This
+-- function evaluates 'hFoldLines' within 'foldEditLines'
+pipeFoldMapLines
+  :: (ref -> EditLine tags fold)
+  -> (ref -> fold -> EditLine tags ())
+  -> CharBufferSize
+  -> ref
+  -> (HaltReadLines fold tags -> LineBreakSymbol -> ReadLines fold tags ())
+  -> PipeControlInitializer
+pipeFoldMapLines read write bufsiz foldref useLine =
+  newEditLineState bufsiz >>= pure . readStream
+  where
+  readStream buf pipeHandle =
+    fmap (const ()) . fst <$>
+    streamEditor
+    ( read foldref >>=
+      newReadLinesState >>=
+      hFoldLines pipeHandle useLine >>= \ (result, readst) ->
+      write foldref (readst ^. readLinesState) >>
+      pure result
+    )
+    buf
 
--- | This function is intended to be used to define a continuation for the
--- 'PipeReceiverConfigfunction' constructor of the 'PipeReceiverConfig' data type. Like
--- 'bufferReceiveLines', it is defined by passing a continuation to 'receiveLineHandler' that stores
--- all received lines into a given 'Buffer', but also allows you to pass your own 'ReadLines'
--- continuation which is also called for each line of text, allowing the 'TextLine' to be both
--- buffered into the given 'Buffer' and also folded (e.g. logged to a file, or to STDOUT) by your
--- own continuation function.
-bufferReceiveLinesPut
-  :: fold
-  -> (HaltReadLines fold void -> TextLine TextTags -> ReadLines fold ())
+-- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
+-- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received is passed to the
+-- 'ReadLines' continuation given here.
+--
+-- The 'ReadLines' function has no backing 'EditTextState', so you do not have random access to
+-- lines in a buffer (to do this, use 'pipeMapBufferLines'). However, evaluating 'newline' or
+-- 'pushLine' will push the content of the current line editor onto a stack and can be pulled with
+-- 'joinLine'.
+pipeMapLines
+  :: CharBufferSize
+  -> (HaltReadLines () tags -> LineBreakSymbol -> ReadLines () tags ())
+  -> PipeControlInitializer
+pipeMapLines bufsiz = pipeFoldMapLines (\ () -> pure ()) (\ () () -> pure ()) bufsiz ()
+
+-- | similar to 'pipeMapLines', this function sets up a loop over the pipe 'Handle' to receive the
+-- byte stream from a child process, and break the byte stream up into 'TextLine's. Each 'TextLine'
+-- received is passed to the 'ReadLines' continuation given here. Unlike 'pipeMapLines', this
+-- function may also update an arbitrary @fold@ value in an 'IORef' that you must create for use
+-- with this function.
+--
+-- The 'ReadLines' function has no backing 'EditTextState', so although you may edit each individual
+-- 'TextLine', evaluating functions such as 'newline', 'pushLine', or 'joinLine' will cause the loop
+-- to end evaluation on that 'TextLine' and iterate on the next incoming 'TextLine'.
+pipeFoldLines
+  :: CharBufferSize
+  -> IORef fold
+  -> (HaltReadLines fold tags -> LineBreakSymbol -> ReadLines fold tags ())
+  -> PipeControlInitializer
+pipeFoldLines = pipeFoldMapLines (liftIO . readIORef) (\ ref -> liftIO . writeIORef ref)
+
+-- | Used to define 'pipeFoldBufferLines' and 'pipeMapBufferLines'.
+pipeFoldMapBufferLines
+  :: (ref -> EditLine TextTags fold)
+  -> (ref -> fold -> EditLine TextTags ())
+  -> ref
   -> Table.Row Buffer
-  -> Handle
-  -> IO (Either EditTextError (), fold)
-bufferReceiveLinesPut fold put row =
-  receiveLineHandler fold
-  (\ halt line -> do
-    liftIO $ withBuffer row $ pushLine Before line
-    put halt line
-  )
+  -> (HaltReadLines fold TextTags -> LineBreakSymbol -> ReadLines fold TextTags ())
+  -> PipeControlInitializer
+pipeFoldMapBufferLines read write foldref row useLine =
+  pure $ \ pipeHandle ->
+  fmap join $
+  withBuffer row $
+  liftEditLine $
+  read foldref >>=
+  newReadLinesState >>=
+  hFoldLines pipeHandle useLine >>= \ (result, readst) ->
+  write foldref (readst ^. readLinesState) >>
+  pure result
+
+-- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
+-- process, and break the byte stream up into 'TextLine's. Each 'ReadLines' function is evaluated on
+-- a 'EditLineState' buffer containing the content of the pipe between line breaking symbols. The
+-- cursor is at the end of the buffer, and you can retrieve a 'TextLine' using @('cutLine'
+-- 'Before')@.
+--
+-- This function is used when you setup a 'PipeReceiverConfig' using the
+-- 'PipeReceiverConfigNewBufferWithFile' constructors.
+--
+-- __WARNING__: if evaluating this function on a 'Buffer', this will lock the buffer until the
+-- entire buffer is full, so it will not be accessible until after the process completes
+-- execution. This is slightly faster, but it can hang your program for a while if you attempt to
+-- access the given 'Buffer' while the chile process is running.
+pipeMapBufferLines
+  :: Table.Row Buffer
+  -> (HaltReadLines () TextTags -> LineBreakSymbol -> ReadLines () TextTags ())
+  -> PipeControlInitializer
+pipeMapBufferLines =
+  pipeFoldMapBufferLines (\ () -> pure ()) (\ () () -> pure ()) ()
+
+-- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
+-- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received is passed to the
+-- 'ReadLines' continuation given here. It combines the functionality of 'pipeFoldLines' and
+-- 'pipeBufferLines', not only evaluating the given continuation function, but also buffering each
+-- 'TextLine' received into the given 'Buffer'. Buffering happens after evaluating the continuation,
+-- so any edits made to the 'TextLine' can be written to the buffer.
+--
+-- __WARNING__: if evaluating this function on a 'Buffer', this will lock the buffer until the
+-- entire buffer is full, so it will not be accessible until after the process completes
+-- execution. This is slightly faster, but it can hang your program for a while if you attempt to
+-- access the given 'Buffer' while the chile process is running.
+pipeFoldBufferLines
+  :: IORef fold
+  -> Table.Row Buffer
+  -> (HaltReadLines fold TextTags -> LineBreakSymbol -> ReadLines fold TextTags ())
+  -> PipeControlInitializer
+pipeFoldBufferLines =
+  pipeFoldMapBufferLines (liftIO . readIORef) (\ ref -> liftIO . writeIORef ref)
 
 -- | Inspect a 'PipeReceiverConfig' and return an 'Exec.StdStream' value that can be used to
 -- construct a 'PipeReceiver', either with 'connectPipeReceiver' or 'connectPipeSender'. This
 -- function attempts to open a file if a 'PipeReceiverConfigFile' or
--- 'PipeReceiverConfigNewBufferWithFile' is given.
+-- 'PipeReceiverConfigNewBufferWithFile' is given. This sets up redirection to a file by opening a
+-- file 'Handle', or redirectinng to an existing 'Handle'.
 pipeReceiverConfigStdStream :: PipeReceiverConfig -> IO Exec.StdStream
 pipeReceiverConfigStdStream = \ case
   PipeReceiverConfigClose -> pure Exec.NoStream
   PipeReceiverConfigInherit -> pure Exec.Inherit
-  PipeReceiverConfigNewBuffer -> pure Exec.CreatePipe
+  PipeReceiverConfigNewBuffer{} -> pure Exec.CreatePipe
   PipeReceiverConfigBuffer{} -> pure Exec.CreatePipe
   PipeReceiverConfigFile path append ->
     Exec.UseHandle <$>
@@ -490,70 +637,88 @@ pipeReceiverConfigStdStream = \ case
   PipeReceiverConfigFunction{} -> pure Exec.CreatePipe
   PipeReceiverConfigHandle{ pipeControlHandle=h } -> pure $ Exec.UseHandle h
 
--- | Evaluate a 'PipeReceiverConfig' to a readable 'Handle', from either a STDOUT or STDERR stream of
--- a child 'Process'.
+-- | Evaluate a 'PipeReceiverConfig' to a readable 'Handle', from either a STDOUT or STDERR stream
+-- of a child 'Process'. If information is to be received from a process via a new file 'Handle', a
+-- controlling thread is launched which can wait on SIGCONT signals.
 pipeReceiver
   :: Maybe Handle
   -> ProcessConfig
   -> PipeReceiverConfig
   -> StateT ManagerEnvState IO PipeReceiver
 pipeReceiver procHandle cfg pipeControl =
-  let requirePipe f = maybe (pure PipeReceiverInherit) f procHandle
-      makeHandlerThread procHandle f = liftIO $ do
+  let requirePipe f =
+        maybe
+        ( error $ "internal error: 'pipeReceiver' evaluating 'ProcessConfig':\n  " <>
+          show cfg <> "\n  should have received a pipe to the child process.\n" <>
+          "  this may be a bug in 'pipeReceiverConfigStdStream'."
+        ) f procHandle
+      makeHandlerThread onErr procHandle initHandler = liftIO $ do
+        -- Launch a thread for waiting on SIGCONT signals and reading the process STDOUT or
+        -- STDERR. An mvar is created to use as a lock, which is unlocked when the process finishes.
+        f <- initHandler
         waitMVar <- newEmptyMVar
         thid <- forkIO $ f procHandle >>= putMVar waitMVar -- brackets here?
         pure (thid, waitMVar)
-      makeConnectBuffer put row procHandle =
-        makeHandlerThread procHandle $
-        (<* (hClose procHandle)) .
-        fmap fst . bufferReceiveLinesPut () put row
+      makeConnectBuffer onErr readLoop row procHandle =
+        -- Launch a thread and capture the process STDOUT or STDERR in a buffer
+        makeHandlerThread onErr procHandle $ readLoop row
   in case pipeControl of
     PipeReceiverConfigClose -> pure PipeReceiverNothing
     PipeReceiverConfigInherit -> pure PipeReceiverInherit
-    PipeReceiverConfigHandle h -> pure $ PipeReceiverHandle{ pipeConnectHandle = h }
-    PipeReceiverConfigFile path append -> requirePipe $ pure . PipeReceiverFile path append
-    PipeReceiverConfigBuffer row -> requirePipe $ \ procHandle -> do
-      (thid, wait) <- makeConnectBuffer (\ _ _ -> pure ()) row procHandle
-      pure PipeReceiverBuffer
-        { pipeConnectHandle = procHandle
-        , pipeConnectBuffer = row
-        , pipeConnectThread = thid
-        , pipeConnectWaitClose = wait
-        }
-    PipeReceiverConfigNewBuffer -> requirePipe $ \ procHandle -> do
-      buf <- internalNewBuffer (showAsText cfg) 63
-      (thid, wait) <- makeConnectBuffer (\ _ _ -> pure ()) buf procHandle
-      pure PipeReceiverBuffer
-        { pipeConnectHandle = procHandle
-        , pipeConnectBuffer = buf
-        , pipeConnectThread = thid
-        , pipeConnectWaitClose = wait
-        }
-    PipeReceiverConfigNewBufferWithFile path append -> requirePipe $ \ procHandle -> do
-      buf <- internalNewBuffer (showAsText cfg) 63
-      logHandle <- liftIO $
-        openFile (Strict.unpack path) (if append then AppendMode else WriteMode)
-      (this, wait) <- makeConnectBuffer
-        (const $ liftIO . Bytes.hPutStr logHandle . bytesFromString)
-        buf procHandle
-      liftIO $ hClose logHandle
-      pure PipeReceiverNewBufferWithFile
-        { pipeConnectHandle = procHandle
-        , pipeConnectFileHandle = logHandle
-        , pipeConnectFile = path
-        , pipeConnectFileAppend = append
-        , pipeConnectBuffer = buf
-        , pipeConnectThread = this
-        , pipeConnectWaitClose = wait
-        }
-    PipeReceiverConfigFunction desc f -> requirePipe $ \ procHandle -> do
-      (this, wait) <- makeHandlerThread procHandle f
-      pure PipeReceiverFunction
-        { pipeConnectDescription = desc
-        , pipeConnectHandle = procHandle
-        , pipeConnectThread = this
-        , pipeConnectWaitClose = wait
-        }
+    PipeReceiverConfigHandle h ->
+      -- Here the 'Handle' h should be the same as 'procHandle'.
+      pure $ PipeReceiverHandle{ pipeConnectHandle = h }
+    PipeReceiverConfigFile path append ->
+      requirePipe $ pure . PipeReceiverFile path append
+    PipeReceiverConfigBuffer row onErr ->
+      requirePipe $ \ procHandle -> do
+        (thid, wait) <- makeConnectBuffer onErr pipeBufferLines row procHandle
+        pure PipeReceiverBuffer
+          { pipeConnectHandle = procHandle
+          , pipeConnectBuffer = row
+          , pipeConnectThread = thid
+          , pipeConnectWaitClose = wait
+          }
+    PipeReceiverConfigNewBuffer onErr ->
+      requirePipe $ \ procHandle -> do
+        buf <- internalNewBuffer (showAsText cfg) Nothing Nothing
+        (thid, wait) <- makeConnectBuffer onErr pipeBufferLines buf procHandle
+        pure PipeReceiverBuffer
+          { pipeConnectHandle = procHandle
+          , pipeConnectBuffer = buf
+          , pipeConnectThread = thid
+          , pipeConnectWaitClose = wait
+          }
+    PipeReceiverConfigNewBufferWithFile path onErr append ->
+      requirePipe $ \ procHandle -> do
+        buf <- internalNewBuffer (showAsText cfg) Nothing Nothing
+        logHandle <- liftIO $
+          openFile (Strict.unpack path) (if append then AppendMode else WriteMode)
+        (this, wait) <-
+          makeConnectBuffer onErr
+          ( flip pipeMapBufferLines $ \ _halt lbrk ->
+            (textLineBreakSymbol .~ lbrk) <$> cutLine Before >>=
+            liftIO . hPutStr logHandle . textLineString
+          ) buf procHandle
+        liftIO $ hClose logHandle
+        pure PipeReceiverNewBufferWithFile
+          { pipeConnectHandle = procHandle
+          , pipeConnectFileHandle = logHandle
+          , pipeConnectFile = path
+          , pipeConnectFileAppend = append
+          , pipeConnectBuffer = buf
+          , pipeConnectThread = this
+          , pipeConnectWaitClose = wait
+          }
+    PipeReceiverConfigFunction desc onErr init ->
+      requirePipe $ \ procHandle -> do
+        (this, wait) <- makeHandlerThread onErr procHandle init
+        pure PipeReceiverFunction
+          { pipeConnectDescription = desc
+          , pipeConnectHandle = procHandle
+          , pipeConnectThread = this
+          , pipeConnectWaitClose = wait
+          }
 
 -- | Create a label from a 'ProcessConfig' which is used as the label in the 'processTable' of the
 -- 'ManagerEnv'.
@@ -566,8 +731,10 @@ processCreateLabel cfg =
 -- | Construct an initial 'Exec.CreateProcess' from a 'ProcessConfig'.
 processConfigCreate :: ProcessConfig -> IO Exec.CreateProcess
 processConfigCreate cfg = do
+  -- Setup 'Handle' redirection, or else inherit from the current process.
   outHandle <- pipeReceiverConfigStdStream $ theProcConfigOutPipe cfg
   errHandle <- pipeReceiverConfigStdStream $ theProcConfigErrPipe cfg
+  -- Construct and return a process configuration needed by "System.Process".
   return $
     ( Exec.proc
       (Strict.unpack $ theProcConfigCommand cfg)
@@ -591,13 +758,18 @@ runProcess0 (Process mvar) = do
       )
     _ -> do
       t0 <- getCurrentTime
+      -- If any redirection file handles need to be created, 'pipeReceiverConfigStdStream' does that
+      -- here via 'processConfigCreate'.
       (pin, pout, perr, phandle) <- processConfigCreate cfg >>= Exec.createProcess
+      -- Now the process *should* be running, and the file handles for pipes to the handles *should*
+      -- exist.
       pid <- Exec.getPid phandle
       let inPipe = pipeSender pin $ theProcConfigInPipe cfg
+      -- Setup the pipe receiver threads.
       ((outPipe, errPipe), mgrst) <- flip runStateT mgrst $
         (,) <$>
         pipeReceiver pout cfg (theProcConfigOutPipe cfg) <*>
-        pipeReceiver perr cfg (theProcConfigOutPipe cfg)
+        pipeReceiver perr cfg (theProcConfigErrPipe cfg)
       let waitForEnd = do
             exitCode <- waitForProcess phandle
             closePipeSender inPipe
@@ -606,6 +778,7 @@ runProcess0 (Process mvar) = do
             pure exitCode
       case pid of
         Nothing -> do
+          -- Process forking failed.
           exitCode <- waitForEnd
           t1 <- getCurrentTime
           pure
@@ -623,6 +796,8 @@ runProcess0 (Process mvar) = do
               )
             )
         Just pid -> do
+          -- Process forking succeeded, create one more thread to wait on SIGCHLD signals, which
+          -- updates the 'ProcessState' when the child process finishes.
           waitThread <- forkIO $ do
             exitCode <- waitForEnd
             t1 <- getCurrentTime
@@ -689,12 +864,12 @@ synchronous cmd args = ProcessConfig
 -- 'stdout' and 'stderr' streams, and create a pipe for the 'stdin' stream to which input can be
 -- written with 'processSend'. So 'theProcConfigInPipe' is set to 'PipeSenderConfigPipe', and both
 -- 'theProcConfigOutPipe' and 'theProcConfigErrPipe' are set to 'PipeReceiverConfigNewBuffer'.
-asynchronous :: ProcessProgramFile -> [Strict.Text] -> ProcessConfig
-asynchronous cmd args =
+asynchronous :: ControlThreadErrorConfig -> ProcessProgramFile -> [Strict.Text] -> ProcessConfig
+asynchronous onErr cmd args =
   (synchronous cmd args)
   { theProcConfigInPipe = PipeSenderConfigPipe
-  , theProcConfigOutPipe = PipeReceiverConfigNewBuffer
-  , theProcConfigErrPipe = PipeReceiverConfigNewBuffer
+  , theProcConfigOutPipe = PipeReceiverConfigNewBuffer onErr
+  , theProcConfigErrPipe = PipeReceiverConfigNewBuffer onErr
   }
 
 -- | Setup a new asynchronous child 'Process', which will capture both 'stdout' and 'stderr' streams
@@ -702,52 +877,48 @@ asynchronous cmd args =
 -- with 'processSend'. So 'theProcConfigInPipe' is set to 'PipeSenderConfigPipe', and both
 -- 'theProcConfigOutPipe' and 'theProcConfigErrPipe' are set to 'PipeReceiverConfigBuffer' with the
 -- same 'Buffer' for both.
-asyncCapture :: ProcessProgramFile -> [Strict.Text] -> Table.Row Buffer -> ProcessConfig
-asyncCapture cmd args buffer =
-  (asynchronous cmd args)
-  { theProcConfigOutPipe = PipeReceiverConfigBuffer buffer
-  , theProcConfigErrPipe = PipeReceiverConfigBuffer buffer
+asyncCapture
+  :: ControlThreadErrorConfig
+  -> ProcessProgramFile
+  -> [Strict.Text]
+  -> Table.Row Buffer
+  -> ProcessConfig
+asyncCapture onErr cmd args buffer =
+  (asynchronous onErr cmd args)
+  { theProcConfigOutPipe = PipeReceiverConfigBuffer buffer onErr
+  , theProcConfigErrPipe = PipeReceiverConfigBuffer buffer onErr
   }
 
 -- | Like 'asyncCapture', but automatically generates a new 'Buffer' for the 'ProcessConfig'. Also
 -- note that this needs to be evaluated in a 'Manager' function context, so that a new 'Buffer' can
 -- be created.
-asyncCaptureNewBuffer :: ProcessProgramFile -> [Strict.Text] -> Manager (Table.Row Buffer, ProcessConfig)
-asyncCaptureNewBuffer cmd args = do
-  buf <- newBuffer (Strict.unwords $ "ASYNC:" : (showAsText <$> (cmd : args))) 63
-  pure (buf, asyncCapture cmd args buf)
+asyncCaptureNewBuffer
+  :: ControlThreadErrorConfig
+  -> ProcessProgramFile
+  -> [Strict.Text]
+  -> Manager (Table.Row Buffer, ProcessConfig)
+asyncCaptureNewBuffer onErr cmd args = do
+  buf <- newBuffer (Strict.unwords $ "ASYNC:" : (showAsText <$> (cmd : args)))
+  pure (buf, asyncCapture onErr cmd args buf)
 
--- | Setup a new asynchronous child 'Process' which will capture the 'stderr' stream to an in-memory
--- 'Buffer' created just for this process, and will capture the 'stdin' stream, receiving each line
--- of characters that the child process outputs and feeding it to the given filter function. The
--- filter function uses the 'StateT' monad transformer to build up some state as it filters lines of
--- input. This state must be stored in an 'MVar' because it is updated in a separate thread, the
--- same thread that listens for characters on the STDOUT stream of the child process.
---
--- ___NOTE:___ that the given 'MVar' is read only once during filtering, every time the filter
--- updates it's @fold@ state, the 'MVar' is written, overwriting whatever was there before. This
--- guarantees that information cannot be introduced into the @fold@ value outside of the filter
--- continuation function you pass as the argument. You may evaluate 'readMVar' on the 'MVar' at any
--- time and retrieve the most up-to-date version of the @fold@ value, but the 'modifyMVar' and
--- 'swapMVar' functions do nothing. __NEVER__ evaluate 'takeMVar' on the 'MVar'.
+-- | Setup a new asynchronous child 'Process' which will use the Haskell "Data.Text.IO" functions to
+-- break a pipe into lines and evaluate
 asyncLineFilter
-  :: ProcessProgramFile
+  :: ControlThreadErrorConfig
+  -> ProcessProgramFile
   -> [Strict.Text]
   -> MVar fold
-  -> (TextLine TextTags -> StateT fold IO ())
+  -> (Strict.Text -> StateT fold IO ())
   -> ProcessConfig
-asyncLineFilter cmd args mvar filter =
-  (asynchronous cmd args)
+asyncLineFilter onErr cmd args mvar filter =
+  (asynchronous onErr cmd args)
   { theProcConfigOutPipe =
     PipeReceiverConfigFunction
     (Strict.unwords $ "FILTER:" : (showAsText <$> (cmd:args)))
-    (\ handle -> do
-      init <- readMVar mvar
-      (result, fold) <-
-        flip (receiveLineHandler init) handle $ \ _halt line ->
-        get >>= liftIO . (execStateT (filter line) >=> evaluate) >>= put >>
-        get >>= liftIO . modifyMVar_ mvar . const . pure
-      modifyMVar mvar $ const $ pure (fold, result)
+    CtrlErrSIGKILL
+    ( pure $ \ pipeHandle ->
+      Strict.hGetLine pipeHandle >>=
+      fmap Right . modifyMVar_ mvar . execStateT . filter
     )
   }
 
@@ -880,7 +1051,7 @@ processGetLog row which fromLine toLine =
 -- of all processes and threads created by the APIs in this module. It is the global runtime
 -- environment.
 newtype Manager a = Manager (ReaderT ManagerEnv (StateT ManagerEnvState IO) a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadReader ManagerEnv)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadFail, MonadReader ManagerEnv)
 
 -- | Provided a 'ManagerEnv' execution environment to keep all mutable state, evaluate a 'Manager'
 -- function within the @IO@ context. Any changes made to the 'ManagerEnv' by evaluation of the 'Manager'
@@ -1055,14 +1226,23 @@ clearWorker worker =
 -- | Create a new data 'Buffer'. Thhis function also registers the buffer into the 'bufferTable' of
 -- the 'ManagerEnv' execution environment, which is why it returns a 'Table.Row'. This is so if you
 -- lose the handle to it while working in GHCI, you can get it back using 'getBuffer'.
-newBuffer :: Table.Label -> VectorSize -> Manager (Table.Row Buffer)
-newBuffer = (managerState .) . internalNewBuffer
+newBuffer :: Table.Label -> Manager (Table.Row Buffer)
+newBuffer lbl = managerState $ internalNewBuffer lbl Nothing Nothing
 
-internalNewBuffer :: Table.Label -> VectorSize -> StateT ManagerEnvState IO (Table.Row Buffer)
-internalNewBuffer label initSize =
+-- | Like 'newBuffer', but specify the buffer initial allocation size. This size may grow as needed,
+-- but you may have a better idea of what initial size is best for a particular task.
+newBufferSized :: Table.Label -> LineBufferSize -> CharBufferSize -> Manager (Table.Row Buffer)
+newBufferSized lbl lineBufSiz charBufSiz = managerState $ internalNewBuffer lbl lineBufSiz charBufSiz
+
+internalNewBuffer
+  :: Table.Label
+  -> LineBufferSize
+  -> CharBufferSize
+  -> StateT ManagerEnvState IO (Table.Row Buffer)
+internalNewBuffer label lineBufSiz charBufSiz =
   Table.withinGroup bufferTable $
   ( liftIO $
-    newEditTextState initSize >>= \ ed ->
+    newEditTextState lineBufSiz charBufSiz >>= \ ed ->
     fmap Buffer $
     newMVar $
     BufferState
@@ -1099,7 +1279,7 @@ bufferShow row range =
   (\ _halt lineNum line -> liftIO $ do
      putStr (ralign6 lineNum)
      Strict.putStr ": "
-     putStrLn (convertString (theTextLineData line))
+     putStr (textLineString line)
      pure Nothing
   )
   ()
@@ -1114,7 +1294,11 @@ bufferHandle :: Table.Label -> Table.Row Buffer -> Handle -> Manager (Table.Row 
 bufferHandle label row handle =
   startWork label $ \ _worker ->
   withBuffer row $
-  loadHandleEditText Nothing handle
+  liftEditLine $
+  newReadLinesState () >>=
+  fmap fst . hFoldLines handle (\ _halt -> lineBreak Before) >>= \ case
+    Left err -> liftIO $ hPutStrLn stderr $ show err
+    Right () -> pure ()
 
 -- | Load a file from the given file path into the given 'Buffer'. Returns the 'Worker' that was
 -- used to load the buffer.
@@ -1128,7 +1312,7 @@ bufferFileInto path buffer = do
 -- buffers the file.
 bufferFile :: Strict.Text -> Manager (Table.Row Worker, Table.Row Buffer)
 bufferFile path = do
-  buffer <- newBuffer path 128
+  buffer <- newBuffer path
   worker <- bufferFileInto path buffer
   return (worker, buffer)
 
