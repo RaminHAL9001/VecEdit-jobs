@@ -1,5 +1,6 @@
 module Main where
 
+import qualified VecEdit.Jobs as Manager
 import VecEdit.Types
   ( RelativeDirection(..), Range(..), TextRange(..),
     EditTextError(..), ppGapBufferErrorInfo,
@@ -11,39 +12,45 @@ import VecEdit.Vector.Editor
     liftEditor, sliceRange, currentBuffer,
   )
 import VecEdit.Vector.Editor.GapBuffer
-  ( newGapBufferState, evalGapBuffer,
-    shiftCursor, pushItem, pullItem, popItem,
-    gapBuffer3SliceInRange,
+  ( newGapBufferState, evalGapBuffer, gapBuffer3SliceInRange,
   )
+import qualified VecEdit.Vector.Editor.GapBuffer as GapBuf
 import VecEdit.Text.String
-  ( TextLine, hReadLines, isAsciiOnly, readLinesLiftGapBuffer,
-    streamByteString, byteStreamToLines, cutUTF8TextLine,
-    StringData, toStringData, convertString
+  ( streamByteString,
+    LineEditor(pushLine, copyBuffer), copyBufferClear, liftEditLine, newReadLinesState,
+    insertString, streamFoldLines, editLineTokenizer, onEditLineState,
+    StringData, CharVector, toStringData, convertString,
+    toCharStream,
+    UTF8Decoder(..), utf8Decoder, utf8DecoderPushByte,
   )
 import VecEdit.Text.Editor
-  ( newEditTextState, evalEditText,
-    lineNumber, flushLine, loadHandleEditText, cursorToEnd, insertString,
-    foldLinesFromCursor, loadHandleEditText, debugViewTextEditor,
+  ( lineNumber, maxLineIndex, cursorToEnd, loadStreamEditText,
+    foldLinesFromCursor, debugViewTextEditor,
   )
-import VecEdit.Jobs (Manager, Buffer, withBuffer, newBuffer, bufferShow)
+import VecEdit.Jobs
+  ( Manager, Buffer, newManagerEnv, runManager, withBuffer, newBuffer,
+  )
 import qualified VecEdit.Table as Table
 
 import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoPrint, displayInfoShow)
 import VecEdit.Text.LineBreak (allLineBreaks, allLineBreaks, lineBreak_LF)
 import VecEdit.Text.Parser
-       ( StringParser, StringParserState, StringParserResult(ParseOK),
-         runStringParser, resumeStringParser, stringParserState,
-         parserString, parserIndex, parserLineIndex, parserIsEOF,
+       ( StringParser, StringParserState(..), StringParserResult(ParseOK, ParseWait),
+         runStringParser, stringParserState, feedStringParser,
        )
 import VecEdit.Text.TokenizerTable (tokTableFold)
 
 import Control.Applicative ((<|>), some)
-import Control.Lens (use, (.=), (+=), (.~), (+~))
+import Control.Lens (use, (.=), (+=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.State (MonadState(..))
+import Control.Monad.State.Class (MonadState(..), modify)
+import Control.Monad.State (StateT, State, runState, evalStateT)
 
+import Data.Bits (Bits(bitSizeMaybe,testBit))
+import Data.Char (chr, ord, isAscii, isPrint)
 import qualified Data.ByteString.UTF8 as UTF8
+import qualified Data.ByteString as Bytes
 import Data.Char (isSpace, isDigit)
 import qualified Data.Vector as Vec
 import Data.Vector (Vector)
@@ -51,6 +58,7 @@ import Data.Vector.Mutable (MVector, IOVector)
 import qualified Data.Text as Strict
 import qualified Data.Text.IO as Strict
 import qualified Data.Vector.Mutable as MVec
+import Data.Word (Word32)
 
 import Text.Parser.Char (satisfy, char, spaces, oneOf, anyChar)
 import Text.Parser.Combinators (many, manyTill, choice, (<?>))
@@ -172,17 +180,17 @@ testGapBuffer = do
           e <- echo msg >> run
           redisplay
           echo $ "got item: " <> Strict.pack (show e <> "\n")
-    mapM_ (pushItem Before) ["zero", "one", "two", "three", "four"]
-    mapM_ (pushItem After) ["nine", "eight", "seven", "six", "five"]
+    mapM_ (GapBuf.pushItem Before) ["zero", "one", "two", "three", "four"]
+    mapM_ (GapBuf.pushItem After) ["nine", "eight", "seven", "six", "five"]
     redisplayln
-    test "pullItem Before" (pullItem Before)
-    test "pullItem After"  (pullItem After)
-    test "popItem Before"  (popItem Before)
-    test "popItem After"   (popItem After)
-    echo "shiftCursor -1" >> shiftCursor (-1) >> redisplayln
-    echo "shiftCursor 1"  >> shiftCursor 1    >> redisplayln
-    echo "shiftCursor -2" >> shiftCursor (-2) >> redisplayln
-    echo "shiftCursor 2"  >> shiftCursor 2    >> redisplayln
+    test "pullItem Before" (GapBuf.pullItem Before)
+    test "pullItem After"  (GapBuf.pullItem After)
+    test "popItem Before"  (GapBuf.popItem Before)
+    test "popItem After"   (GapBuf.popItem After)
+    echo "shiftCursor -1" >> GapBuf.shiftCursor (-1) >> redisplayln
+    echo "shiftCursor 1"  >> GapBuf.shiftCursor 1    >> redisplayln
+    echo "shiftCursor -2" >> GapBuf.shiftCursor (-2) >> redisplayln
+    echo "shiftCursor 2"  >> GapBuf.shiftCursor 2    >> redisplayln
     testRange  0 16
     testRange  1 15
     testRange  1 14
@@ -212,7 +220,9 @@ debugViewBuffer = flip withBuffer $ debugViewTextEditor
 -- | Run tests on 'Buffer's.
 testTextEditor :: Manager (Table.Row Buffer)
 testTextEditor = do
-  buf <- newBuffer "test editor" 32
+  liftIO $ putStrLn "new buffer: \"test editor\""
+  buf <- newBuffer "test editor"
+  liftIO $ putStrLn "\"test editor\" insertString ..."
   result <-
     withBuffer buf $ do
       insertString $
@@ -233,63 +243,225 @@ testTextEditor = do
       ins2 "structure manipulation, are all built-" "in. Pretty soon, JIT compilation of\n"
       ins2 "Emacs Lisp code will be a standard feature, " "which will make Emacs Lisp\n"
       ins2 "code comparable in speed to lanugages " "like JavaScript.</p>"
-      flushLine
+      copyBuffer
       --debugViewTextEditor
       lineNumber
+  liftIO $ putStrLn "\"test editor\" bufferShow ..."
   case result of
     Right line ->
-      bufferShow buf (TextRange 1 line) >>= \ case
+      Manager.bufferShow buf (TextRange 1 line) >>= \ case
         Right () -> return buf
         Left err -> error (show err)
     Left  err  -> error (show err)
 
 ----------------------------------------------------------------------------------------------------
 
+showBinary :: Bits b => b -> String
+showBinary w = loop (0::Int) "" where
+  len = maybe maxBound id $ bitSizeMaybe w
+  loop cursor stack =
+    if cursor >= len then stack else
+    (loop $! cursor + 1) $
+    ( if mod cursor 8 == 7 then (' ' :) else
+      if mod cursor 4 == 3 then (',' :) else id
+    ) $
+    (if testBit w cursor then '1' else '0') : stack
+
+printBinary :: Bits b => b -> IO ()
+printBinary = putStrLn . showBinary
+
+showUTF8Decoder :: UTF8Decoder -> String
+showUTF8Decoder o = unlines
+  [ "    decoded: " <> showBinary (theUTF8DecodedValue o)
+  , "      store: " <> showBinary (theUTF8ElemStore o)
+  , "elemCount: " <> show (theUTF8ElemCount o) <>
+    ", countdown: " <> show (theUTF8Countdown o)
+  , "total chars: " <> show (theUTF8CharCounter o) <>
+    ", total bytes: " <> show (theUTF8ByteCounter o)
+  ]
+
+-- | Run a 'UTF8Decoder' on a given 'UTF8.ByteString', printing to STDOUT the state of the decoder
+-- after every byte. Optionally pass a 'String' equivalent of the encoded 'UTF8.ByteString' to
+-- compare the result of the 'UTF8Decoder', it will fail if the decoded characters are not identical
+-- to the given 'String'.
+illustrateUTF8Decoder :: Maybe String -> UTF8.ByteString -> IO ()
+illustrateUTF8Decoder compare = flip evalStateT compare . loop utf8Decoder where
+  word32 :: Char -> Word32
+  word32 = fromIntegral . ord
+  stepCompare c = get >>= \ case
+    Nothing -> pure True
+    Just "" -> liftIO $ do
+      putStrLn "*** ERROR: expected string ends prematurely ***"
+      pure False
+    Just (s:str) ->
+      if c == s then put (Just str) >> pure True else liftIO $ do
+        putStrLn $
+          "*** ERROR: decoded character " <> show c <>
+          " does not match expected " <> show s <>
+          " ***\n decoded: " <> showBinary (word32 c) <>
+          "\nexpected: " <> showBinary (word32 s)
+        pure False
+  checkFinal = get >>= \ case
+    Nothing -> pure ()
+    Just "" -> pure ()
+    Just str ->
+      liftIO $ putStrLn $
+      "*** ERROR: decoding string ended prematurely ***\nremaining: " <> show str
+  showState :: StateT (Maybe String) IO a -> State UTF8Decoder (StateT (Maybe String) IO a)
+  showState ret =
+    get >>= \ st -> pure $
+    liftIO (putStrLn $ showUTF8Decoder st) >> ret
+  loop :: UTF8Decoder -> UTF8.ByteString -> StateT (Maybe String) IO ()
+  loop decoder0 str0 =
+    if Bytes.length str0 <= 0 then checkFinal else do
+      let c8 = Bytes.head str0
+      let c = chr $ fromIntegral c8
+      let str = Bytes.tail str0
+      let (more, decoder) =
+            flip runState decoder0 $
+            utf8DecoderPushByte True
+            (showState $ pure True)
+            (\ c -> showState $ do
+                liftIO $ putStrLn $ "*** EMIT CHAR: " <> show c <> " ***\n"
+                stepCompare c
+            )
+            ( showState $ do
+                liftIO $ putStrLn $ "*** ERROR: failed to decode ***"
+                pure False
+            )
+            c8
+      liftIO $ putStrLn $ "*** INPUT WORD " <> showBinary c8 <>
+        (if isAscii c && isPrint c then (' ' : show c) else "") <>
+        " ***"
+      ok <- more
+      when ok $ loop decoder str
+
+----------------------------------------------------------------------------------------------------
+
+haiku :: String
+haiku = 
+  "菜の花や\n" <>
+  "月は東に\n" <>
+  "日は西に\n"
+
+haikuUTF8 :: Bytes.ByteString
+haikuUTF8 = UTF8.fromString haiku
+
+-- | Some examples of poorly encoded UTF8 strings, each with 1 too many component bytes.
+tooManyBytesUTF8 :: [UTF8.ByteString]
+tooManyBytesUTF8 =
+  [ "\xDF\x81\x80 Hello, world!"
+  , "\xEF\x81\x81\x80 Hello, world!"
+  , "\xF7\x81\x81\x81\x80 Hello, world!"
+  ]
+
+-- | Some examples of poorly encoded UTF8 strings, each with 1 too few component bytes.
+tooFewBytesUTF8 :: [UTF8.ByteString]
+tooFewBytesUTF8 =
+  [ "\xDF Hello, world!"
+  , "\xEF\x81 Hello, world!"
+  , "\xF7\x81\x81 Hello, world!"
+  ]
+
+-- | Some examples of poorly encoded UTF8 strings, these are multi-byte UTF-8 encoded characters
+-- with code points smaller than 128 (ASCII characters). These characters should be encoded as
+-- single-bytes. All of these strings are incorrect ways of encoding the capital letter 'A'.
+multiByteASCII :: [UTF8.ByteString]
+multiByteASCII =
+  [ "\xC1\x81 Hello, world!"
+  , "\xE0\x81\x81 Hello, world!"
+  , "\xF0\x80\x81\x81 Hello, world!"
+  ]
+
+sampleText :: String
+sampleText =
+  "this is a simple test\nto see what I can accomplish.\nIt is getting late\r\n" <>
+  "I am having trouble focusing.\n\rI am not insomniac, just have lots to do.\v" <>
+  "Here is hoping my tests all pass.\f" <>
+  "zero\0one\0two\0three\0four\0five\0six\0seven\0eight\0nine\0" <>
+  "The numbers are done for today.\n"
+
+sampleTextUTF8 :: UTF8.ByteString
+sampleTextUTF8 =  UTF8.fromString sampleText
+
 -- | Run tests on 'TextString' functions.
-testByteStreamToLines :: IO ()
+testByteStreamToLines :: Manager ()
 testByteStreamToLines = do
   -- Show the content of the 'allLineBreaks' table.
-  tokTableFold
-    (\ before (c, tok, st) -> before >> print (c, show tok, st))
-    (pure ())
-    allLineBreaks
-  putStrLn ""
+  liftIO $ do
+    tokTableFold
+      (\ before (c, tok, st) -> before >> print (c, show tok, st))
+      (pure ())
+      allLineBreaks
+    putStrLn ""
+  --
+  let mkStream = streamByteString $ sampleTextUTF8 <> haikuUTF8
   --
   -- Test 'byteStreamToLines' on an ByteString
-  let mkStream = streamByteString $ UTF8.fromString $
-        "this is a simple test\nto see what I can accomplish.\nIt is getting late\r\n" <>
-        "I am having trouble focusing.\n\rI am not insomniac, just have lots to do.\v" <>
-        "Here is hoping my tests all pass.\f" <>
-        "zero\0one\0two\0three\0four\0five\0six\0seven\0eight\0nine\0" <>
-        "The numbers are done for today.\n"
-  let foldline _halt lbrk = do
-        i <- get
-        line <-
-          isAsciiOnly >>=
-          readLinesLiftGapBuffer .
-          cutUTF8TextLine lbrk
-        liftIO $ putStrLn $ show i <> ": " <> show (line :: TextLine ())
-        put $! (i::Int) + 1
-  let runLineBreaker table = do
-        h <- mkStream
-        buf <- newGapBufferState (Just 0) 128
-        byteStreamToLines table buf h foldline (1::Int)
-  putStrLn "test 'allLineBreaks'"
-  runLineBreaker allLineBreaks
-  putStrLn ""
+  buf <- newBuffer "test bytes stream to lines"
+  let runLineBreaker lbrkTable h = withBuffer buf $ liftEditLine $ do
+        -- Evaluate a 'streamFoldLines' function to produce a bunch of 'TextLine's from the 'h'
+        -- stream. Then evaluate this in the 'foldEditLinesIO' function to evaluate the monad.
+        onEditLineState $ editLineTokenizer .= lbrkTable
+        (result, _readst) <-
+          newReadLinesState (0::Int) >>=
+          streamFoldLines h
+          ( \ _halt lbrk -> do
+              i <- modify (+ 1) >> get
+              line <- copyBufferClear lbrk
+              liftIO $ putStrLn $ show i <> ": " <> show line
+              pushLine Before line
+          )
+        liftIO $ putStrLn $ case result of
+          Left err -> show err
+          Right  i -> "Lines: " <> show i
+  liftIO $ putStrLn "test 'allLineBreaks'"
+  liftIO mkStream >>=
+    runLineBreaker allLineBreaks
+  liftIO $ putStrLn ""
   --
-  putStrLn "test 'lineBreak_LF'"
-  runLineBreaker lineBreak_LF
-  putStrLn ""
+  liftIO $ putStrLn "test 'lineBreak_LF'"
+  liftIO mkStream >>=
+    runLineBreaker lineBreak_LF
+  liftIO $ putStrLn ""
   --
-  -- Test 'byteStreamToLines' on a file via the 'hReadLines' function.
-  buf <- newGapBufferState (Just 0) 128
-  h <- openFile "./emacs-hacker.cabal" ReadMode
-  flip (hReadLines buf h) (1::Int) $ \ _halt line -> do
-    i <- get
-    liftIO $ putStrLn $ show i <> ": " <> show (line :: TextLine ())
-    put $! i + 1
-  hClose h
+
+-- | This is a test function.
+bufferCabalFile :: Manager (Table.Row Buffer)
+bufferCabalFile = do
+  let filepath =  "./emacs-hacker.cabal" :: String
+  buf <- newBuffer (Strict.pack filepath)
+  result <- withBuffer buf $ do
+    h <- liftIO (openFile filepath ReadMode)
+    liftIO $ putStrLn $ "loaded file " <> show filepath
+    loadStreamEditText h
+    liftIO $ hClose h
+    let showLinesNumbered _halt i line = do
+          liftIO $ putStrLn $ show i <> ": " <> show (fmap (const ()) line)
+          pure Nothing
+    linum <- lineNumber
+    count <- maxLineIndex
+    liftIO $ putStrLn $
+      "loaded file stream: lines = " <> show count <>
+      ", cursor = " <> show linum <> "\ncursorToEnd Before ...."
+    cursorToEnd Before
+    linum <- lineNumber
+    liftIO $ putStrLn $
+      "moved cursor to start of buffer, cursor = " <> show linum <>
+      "\n"
+    foldLinesFromCursor After showLinesNumbered (1::Int)
+    liftIO $ putStrLn $
+      "--------------------------------------------" <>
+      "------------------------\nprint in reverse\n" <>
+      "cursorToEnd After ..."
+    cursorToEnd After
+    linum <- lineNumber
+    liftIO $ putStrLn $
+      "moved cursor to end of buffer, cursor = " <> show linum
+    foldLinesFromCursor Before showLinesNumbered (1::Int)
+  case result of
+    Right _i -> pure buf
+    Left err -> fail $ "buffering cabal file failed: " <> show err
 
 ----------------------------------------------------------------------------------------------------
 
@@ -327,7 +499,7 @@ closeOf = \ case
   '{' -> '}'
   c   -> c
 
-sexpr :: StringParser StringData IO SExpr
+sexpr :: StringParser IO SExpr
 sexpr =
   let makestr = toStringData . Just in
   choice
@@ -371,10 +543,10 @@ sexpr =
   ] <?> "s-expression"
 
 parseTest
-  :: (Show str, Show a)
-  => StringParser str IO a
-  -> StringParserState str
-  -> IO (StringParserResult str IO a, StringParserState str)
+  :: Show a
+  => StringParser IO a
+  -> StringParserState
+  -> IO (StringParserResult IO a, StringParserState)
 parseTest p st = do
   (result, st) <- runStringParser p st
   displayInfoPrint st
@@ -383,31 +555,33 @@ parseTest p st = do
   pure (result, st)
 
 parseStep
-  :: (Show str, Show a)
-  => StringParserResult str IO a
-  -> StringParserState str
-  -> IO (StringParserResult str IO a, StringParserState str)
-parseStep p st = do
-  (result, st) <- resumeStringParser p st
-  displayInfoPrint st
-  print result
-  putStrLn ""
-  pure (result, st)
+  :: Show a
+  => StringParserResult IO a
+  -> StringParserState
+  -> IO (StringParserResult IO a, StringParserState)
+parseStep p st = case p of
+  ParseWait p -> do
+    (result, st) <- runStringParser p st
+    displayInfoPrint st
+    print result
+    putStrLn ""
+    pure (result, st)
+  p -> print p >> pure (p, st)
 
-newParse :: String -> StringParserState StringData
-newParse = stringParserState . convertString
+newParse :: String -> StringParserState
+newParse str =
+  stringParserState
+  { theParserIsEOF = False
+  , theParserStream = toCharStream 0 str
+  }
 
-feedLine :: Bool -> String -> StringParserState StringData -> StringParserState StringData
-feedLine eof line =
-  (parserIsEOF .~ eof) .
-  (parserString .~ convertString line) .
-  (parserLineIndex +~ 1) .
-  (parserIndex .~ 0)
+chvec :: String -> CharVector
+chvec = convertString
 
 testStringParser :: IO ()
 testStringParser = do
   (a, st) <- parseTest sexpr $ newParse "(print \"Hello, world!\\n\"\n"
-  (ParseOK a, _) <- parseStep a $ feedLine True "  :i 1.5432e-3 :j 950)\n" st
+  (ParseOK a, _) <- parseStep a $ feedStringParser st True (chvec "  :i 1.5432e-3 :j 950)\n")
   let expect = Form $ Vec.fromList
         [ SymLit "print"
         , StringLit "\"Hello, world!\\n\""
@@ -421,19 +595,26 @@ testStringParser = do
 
 ----------------------------------------------------------------------------------------------------
 
+-- | Create a new 'Manager' state and use it just once to evaluate the given 'Manager' continuation.q
+withNewManager :: Manager a -> IO a
+withNewManager = (newManagerEnv >>=) . runManager
+
 -- | Run all tests.
 main :: IO ()
-main =
-  testStringParser >>
-  newEditTextState 128 >>=
-  ( evalEditText $
-    liftIO (openFile "./emacs-hacker.cabal" ReadMode) >>=
-    loadHandleEditText Nothing >>
-    (do cursorToEnd Before
-        flip (foldLinesFromCursor After) (1::Int) $ \ _halt i line -> do
-          liftIO $ putStrLn $ show i <> ": " <> show (fmap (const ()) line)
-          pure Nothing
-    )
-  ) >>= \ case
-    Left err -> error $ show err
-    Right _i -> pure ()
+main = do
+  --------------------------
+  -- Basic tests, sanity checking.
+  testEditor
+  testGapBuffer
+  --------------------------
+  -- Tests that run in a manager environment
+  env <- newManagerEnv
+  flip runManager env $ do
+    testTextEditor
+    testByteStreamToLines
+    bufferCabalFile
+  --------------------------
+  -- Parser tests
+  testStringParser
+  --------------------------
+  pure ()
