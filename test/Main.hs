@@ -17,7 +17,7 @@ import VecEdit.Vector.Editor.GapBuffer
 import qualified VecEdit.Vector.Editor.GapBuffer as GapBuf
 import VecEdit.Text.String
   ( streamByteString,
-    LineEditor(pushLine, copyBuffer), copyBufferClear, liftEditLine, newReadLinesState,
+    LineEditor(pushLine, copyBuffer), copyBufferClear, liftEditLine, newEditStreamState,
     insertString, streamFoldLines, editLineTokenizer, onEditLineState,
     StringData, CharVector, toStringData, convertString,
     toCharStream,
@@ -404,7 +404,7 @@ testByteStreamToLines = do
         -- stream. Then evaluate this in the 'foldEditLinesIO' function to evaluate the monad.
         onEditLineState $ editLineTokenizer .= lbrkTable
         (result, _readst) <-
-          newReadLinesState (0::Int) >>=
+          newEditStreamState (0::Int) >>=
           streamFoldLines h
           ( \ _halt lbrk -> do
               i <- modify (+ 1) >> get

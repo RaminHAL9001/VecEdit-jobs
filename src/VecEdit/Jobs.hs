@@ -62,8 +62,8 @@ import VecEdit.Text.String
   ( TextLine, StringData, textLineString, textLineBreakSymbol,
     LineEditor(..), EditLine,
     newEditLineState, lineBreak,
-    ReadLines, HaltReadLines,
-    newReadLinesState, readLinesState,
+    EditStream, HaltEditStream,
+    newEditStreamState, editStreamState,
     fromStringData, hFoldLines, streamEditor,
   )
 import VecEdit.Text.Editor
@@ -254,7 +254,7 @@ data PipeReceiverConfig
      -- what this function actually does with the 'Handle' is completely opaque. For all other
      -- stream receiver/sender mechanisms that are not handled by the other constructors of this
      -- data type, you can define your own with this constructor. You can of course also create a
-     -- text buffer a evaluate a 'ReadLines' loop on the 'Handle', if you do not like the way
+     -- text buffer a evaluate a 'EditStream' loop on the 'Handle', if you do not like the way
      -- 'PipeReceiverConfigBuffer' does it.
 
 -- | Functions of this type are initialzers for a function that reads bytes from a file
@@ -515,7 +515,7 @@ pipeFoldMapLines
   -> (ref -> fold -> EditLine tags ())
   -> CharBufferSize
   -> ref
-  -> (HaltReadLines fold tags -> LineBreakSymbol -> ReadLines fold tags ())
+  -> (HaltEditStream fold tags -> LineBreakSymbol -> EditStream fold tags ())
   -> PipeControlInitializer
 pipeFoldMapLines read write bufsiz foldref useLine =
   newEditLineState bufsiz >>= pure . readStream
@@ -524,40 +524,40 @@ pipeFoldMapLines read write bufsiz foldref useLine =
     fmap (const ()) . fst <$>
     streamEditor
     ( read foldref >>=
-      newReadLinesState >>=
+      newEditStreamState >>=
       hFoldLines pipeHandle useLine >>= \ (result, readst) ->
-      write foldref (readst ^. readLinesState) >>
+      write foldref (readst ^. editStreamState) >>
       pure result
     )
     buf
 
 -- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
 -- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received is passed to the
--- 'ReadLines' continuation given here.
+-- 'EditStream' continuation given here.
 --
--- The 'ReadLines' function has no backing 'EditTextState', so you do not have random access to
+-- The 'EditStream' function has no backing 'EditTextState', so you do not have random access to
 -- lines in a buffer (to do this, use 'pipeMapBufferLines'). However, evaluating 'newline' or
 -- 'pushLine' will push the content of the current line editor onto a stack and can be pulled with
 -- 'joinLine'.
 pipeMapLines
   :: CharBufferSize
-  -> (HaltReadLines () tags -> LineBreakSymbol -> ReadLines () tags ())
+  -> (HaltEditStream () tags -> LineBreakSymbol -> EditStream () tags ())
   -> PipeControlInitializer
 pipeMapLines bufsiz = pipeFoldMapLines (\ () -> pure ()) (\ () () -> pure ()) bufsiz ()
 
 -- | similar to 'pipeMapLines', this function sets up a loop over the pipe 'Handle' to receive the
 -- byte stream from a child process, and break the byte stream up into 'TextLine's. Each 'TextLine'
--- received is passed to the 'ReadLines' continuation given here. Unlike 'pipeMapLines', this
+-- received is passed to the 'EditStream' continuation given here. Unlike 'pipeMapLines', this
 -- function may also update an arbitrary @fold@ value in an 'IORef' that you must create for use
 -- with this function.
 --
--- The 'ReadLines' function has no backing 'EditTextState', so although you may edit each individual
--- 'TextLine', evaluating functions such as 'newline', 'pushLine', or 'joinLine' will cause the loop
--- to end evaluation on that 'TextLine' and iterate on the next incoming 'TextLine'.
+-- The 'EditStream' function has no backing 'EditTextState', so although you may edit each
+-- individual 'TextLine', evaluating functions such as 'newline', 'pushLine', or 'joinLine' will
+-- cause the loop to end evaluation on that 'TextLine' and iterate on the next incoming 'TextLine'.
 pipeFoldLines
   :: CharBufferSize
   -> IORef fold
-  -> (HaltReadLines fold tags -> LineBreakSymbol -> ReadLines fold tags ())
+  -> (HaltEditStream fold tags -> LineBreakSymbol -> EditStream fold tags ())
   -> PipeControlInitializer
 pipeFoldLines = pipeFoldMapLines (liftIO . readIORef) (\ ref -> liftIO . writeIORef ref)
 
@@ -567,7 +567,7 @@ pipeFoldMapBufferLines
   -> (ref -> fold -> EditLine TextTags ())
   -> ref
   -> Table.Row Buffer
-  -> (HaltReadLines fold TextTags -> LineBreakSymbol -> ReadLines fold TextTags ())
+  -> (HaltEditStream fold TextTags -> LineBreakSymbol -> EditStream fold TextTags ())
   -> PipeControlInitializer
 pipeFoldMapBufferLines read write foldref row useLine =
   pure $ \ pipeHandle ->
@@ -575,14 +575,14 @@ pipeFoldMapBufferLines read write foldref row useLine =
   withBuffer row $
   liftEditLine $
   read foldref >>=
-  newReadLinesState >>=
+  newEditStreamState >>=
   hFoldLines pipeHandle useLine >>= \ (result, readst) ->
-  write foldref (readst ^. readLinesState) >>
+  write foldref (readst ^. editStreamState) >>
   pure result
 
 -- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
--- process, and break the byte stream up into 'TextLine's. Each 'ReadLines' function is evaluated on
--- a 'EditLineState' buffer containing the content of the pipe between line breaking symbols. The
+-- process, and break the byte stream up into 'TextLine's. Each 'EditStream' function is evaluated
+-- on a 'EditLineState' buffer containing the content of the pipe between line breaking symbols. The
 -- cursor is at the end of the buffer, and you can retrieve a 'TextLine' using @('cutLine'
 -- 'Before')@.
 --
@@ -595,14 +595,14 @@ pipeFoldMapBufferLines read write foldref row useLine =
 -- access the given 'Buffer' while the chile process is running.
 pipeMapBufferLines
   :: Table.Row Buffer
-  -> (HaltReadLines () TextTags -> LineBreakSymbol -> ReadLines () TextTags ())
+  -> (HaltEditStream () TextTags -> LineBreakSymbol -> EditStream () TextTags ())
   -> PipeControlInitializer
 pipeMapBufferLines =
   pipeFoldMapBufferLines (\ () -> pure ()) (\ () () -> pure ()) ()
 
 -- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
 -- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received is passed to the
--- 'ReadLines' continuation given here. It combines the functionality of 'pipeFoldLines' and
+-- 'EditStream' continuation given here. It combines the functionality of 'pipeFoldLines' and
 -- 'pipeBufferLines', not only evaluating the given continuation function, but also buffering each
 -- 'TextLine' received into the given 'Buffer'. Buffering happens after evaluating the continuation,
 -- so any edits made to the 'TextLine' can be written to the buffer.
@@ -614,7 +614,7 @@ pipeMapBufferLines =
 pipeFoldBufferLines
   :: IORef fold
   -> Table.Row Buffer
-  -> (HaltReadLines fold TextTags -> LineBreakSymbol -> ReadLines fold TextTags ())
+  -> (HaltEditStream fold TextTags -> LineBreakSymbol -> EditStream fold TextTags ())
   -> PipeControlInitializer
 pipeFoldBufferLines =
   pipeFoldMapBufferLines (liftIO . readIORef) (\ ref -> liftIO . writeIORef ref)
@@ -1295,7 +1295,7 @@ bufferHandle label row handle =
   startWork label $ \ _worker ->
   withBuffer row $
   liftEditLine $
-  newReadLinesState () >>=
+  newEditStreamState () >>=
   fmap fst . hFoldLines handle (\ _halt -> lineBreak Before) >>= \ case
     Left err -> liftIO $ hPutStrLn stderr $ show err
     Right () -> pure ()
