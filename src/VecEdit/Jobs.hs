@@ -12,7 +12,7 @@ module VecEdit.Jobs
     withBuffer, withBufferPath,
 
     -- ** 'Worker's (threads)
-    Worker, WorkerStatus, startWork,
+    Worker, WorkerStatus, startWork, haltWorker,
     workerPrintAll, workerList, workerGetStatus,
 
     -- ** 'Process'es and Jobs
@@ -28,9 +28,10 @@ module VecEdit.Jobs
     -- process. You can also define your own continuation for receiving raw strings from the output
     -- and error streams via an IO 'Handle'. Once a process is created and in the process table, it
     -- can be run as a job.
-    ProcessConfig(..), ProcessProgramFile, ProcessState,
+    ProcessConfig(..),
+    ProcessProgramFile, ProcessState,
     procConfigCommand, procConfigArgs,
-    ControlThreadErrorConfig(..), PipeControlInitializer,
+    PipeControlInitializer, ControlThreadErrorConfig(..), controlThreadErrorConfig,
 
     -- *** Configuring how data is sent to and received from a child process.
     PipeSenderConfig(..), PipeReceiverConfig(..),
@@ -41,8 +42,9 @@ module VecEdit.Jobs
     
     -- *** Running a 'Process' as a job
     Process, newProcess, runProcess,
+    processGetConfig, ProcessStateInfo(..), processStateInfo,
     processPrintAll, processList, processFindById,
-    processSend, processGetState, processWait, processCancel,
+    processSend, processWait, processCancel, processRemove, processRemoveAll,
     processGetCaptureBuffer,
     GetProcessBuffer(..), ProcessLog(..), processGetLog,
 
@@ -55,16 +57,19 @@ import VecEdit.Types
     LineBufferSize, CharBufferSize, EditTextError(..),
   )
 
-import VecEdit.Vector.Editor ( ralign6 )
-import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoShow, showAsText)
-import VecEdit.Text.LineBreak (LineBreakSymbol)
-import VecEdit.Text.String
-  ( TextLine, StringData, textLineString, textLineBreakSymbol,
-    LineEditor(..), EditLine,
-    newEditLineState, lineBreak,
-    EditStream, HaltEditStream,
-    newEditStreamState, editStreamState,
-    fromStringData, hFoldLines, streamEditor,
+import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoShow, showAsText, ralign6)
+import VecEdit.Text.Line.Break (LineBreakSymbol)
+import VecEdit.Text.Line
+  ( TextLine, StringData,
+    textLineString, textLineBreakSymbol, fromStringData,
+  )
+import VecEdit.Text.Line.Editor
+  ( LineEditor(..), EditLine,
+    newEditLineState, lineBreak, streamEditorStack, copyBufferClear,
+  )
+import VecEdit.Text.Stream
+  ( EditStream, HaltEditStream,
+    newEditStreamState, editStreamState, hFoldLines,
   )
 import VecEdit.Text.Editor
   ( EditText, EditTextState,
@@ -74,13 +79,20 @@ import VecEdit.Text.Editor
 import qualified VecEdit.Table as Table
 import VecEdit.Table (Table)
 
+import Control.Arrow ((|||), (>>>))
 import Control.Concurrent (ThreadId, forkIO, yield)
 import Control.Concurrent.MVar
-       (MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_, takeMVar, putMVar, withMVar)
-import Control.Exception (SomeException, catch)
+  ( MVar, newEmptyMVar, newMVar, readMVar, modifyMVar, modifyMVar_,
+    takeMVar, putMVar, withMVar,
+  )
+
+import Control.Exception
+  ( SomeException, AsyncException(UserInterrupt), catch, throwTo
+  )
 import Control.Lens (Lens', lens, use, (^.), (.~), (%=), (.=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
+import Control.Monad.Except (throwError)
 import Control.Monad.Reader (MonadReader, ask, ReaderT(..))
 import Control.Monad.State (StateT(..), MonadState(..), runStateT, execStateT)
 import Control.Monad.Trans (lift)
@@ -93,13 +105,18 @@ import Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Data.Vector as Vec
 import Data.Vector (Vector)
 
-import System.IO (Handle, IOMode(..), openFile, hClose, hFlush, hPutStr, hPutStrLn, stderr)
+import System.IO
+  ( Handle, IOMode(..), openFile, hIsClosed, hClose,
+    hGetContents, hFlush, hPrint, hPutStr, hPutStrLn, stderr
+  )
 import qualified System.Process as Exec
 import System.Process
-       ( ProcessHandle,
-         waitForProcess, getProcessExitCode, interruptProcessGroupOf
-       )
+  ( ProcessHandle,
+    waitForProcess, getProcessExitCode, interruptProcessGroupOf
+  )
 import System.Exit (ExitCode(..))
+import qualified System.Posix.Signals as POSIX
+import System.Posix.Signals (sigABRT, sigKILL)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -159,6 +176,12 @@ data WorkerStatus
 instance Eq  Worker where { (==) = (==) `on` theWorkerId; }
 instance Ord Worker where { compare = compare `on` theWorkerId; }
 
+instance Show Worker where
+  show (Worker{theWorkerId=wid}) =
+    "(Worker" <>
+    dropWhile (/= ' ') (show wid) <>
+    ")"
+
 instance DisplayInfo Worker where
   displayInfo putStr (Worker{theWorkerId=thid,theWorkerStatus=mvar}) = do
     stat <- readMVar mvar
@@ -184,11 +207,11 @@ newtype Process = Process (MVar ProcessConfig)
 data ProcessConfig
   = ProcessConfig
     { theProcConfigCommand :: !ProcessProgramFile
-    , theProcConfigArgs :: !(Vector Strict.Text)
-    , theProcConfigInPipe :: !PipeSenderConfig
+    , theProcConfigArgs    :: !(Vector Strict.Text)
+    , theProcConfigInPipe  :: !PipeSenderConfig
     , theProcConfigOutPipe :: !PipeReceiverConfig
     , theProcConfigErrPipe :: !PipeReceiverConfig
-    , theProcConfigState :: !ProcessState
+    , theProcConfigState   :: !ProcessState
     }
 
 procConfigCommand :: Lens' ProcessConfig ProcessProgramFile
@@ -273,37 +296,57 @@ data PipeReceiverConfig
 -- function type.
 type PipeControlInitializer = IO (Handle -> IO (Either EditTextError ()))
 
+data ControlThreadErrorSignal = CtrlErrNoSignal | CtrlErrSIGABRT | CtrlErrSIGKILL
+  deriving (Eq, Ord, Enum)
+
+instance Show ControlThreadErrorSignal where
+  show = \ case
+    CtrlErrNoSignal -> "#f"
+    CtrlErrSIGABRT  -> "'ABRT"
+    CtrlErrSIGKILL  -> "'KILL"
+
 -- | When a child process is launched, local threads are also launched to recieve information that
 -- the child process emits on it's 'stdout' and 'stderr' channels. These threads run computations
 -- that typically inspect the byte stream and buffer the bytes. These computations may fail,
 -- however, and if a thread that was controlling the child process output fails, a decision must be
--- made as to what should be done.
+-- made as to what should be done. The default constructor is 'controlThreadErrorConfig'.
+--
+-- The order in which error event handling actions occur is this:
+--
+--   1. If the number of errors occured has not exceeded 'onErrorRetryTimes' then evaluate
+--      the 'PipeControlInitializer' again and try to resume reading input
+--
+--   2. 
 data ControlThreadErrorConfig
-  = CtrlErrIgnore
-    -- ^ ignore the error entirely. This may hang the child process.
-  | CtrlErrPrint
-    -- ^ ignore the error, but print it to the local 'stderr' and log it in any local error
-    -- buffer. This may hang the child process.
-  | CtrlErrRelaunch !Int
-    -- ^ Launch a new thread with a re-intitialized capture buffer and attempt to resume reading
-    -- from the child process. The function @IO (Handle -> IO (Either EditTextError ()))@ should
-    -- re-initialize a function for reading the byte stream.
-  | CtrlErrSIGABRT
-    -- ^ Send a 'SIGABRT' signal to the child process.
-  | CtrlErrSIGKILL
-    -- ^ Send a 'SIGKILL' signal to the child process.
-  | CtrlErrClosePipe
-    -- ^ Call 'hClose' on the child's STDOUT and/or STDERR stream. This will usually cause the OS to
-    -- send a 'SIGPIPE' signal to the child process, which usually causes the child process to die.
+  = ControlThreadErrorConfig
+    { onErrorVentHandle :: !Bool
+      -- ^ Enter into a loop that takes all data from the process 'Handle' and deletes it. This is
+      -- 'False' by default.
+    , onErrorPrintStderr :: !Bool
+      -- ^ Try to print the error message to 'stderr'. This is 'True' by default.
+    , onErrorCloseHandle :: !Bool
+      -- ^ Try to close the handle from the child process. This will likely cause the operating
+      -- system to send the @SIGPIPE@ signal, which terminates the process same as @SIGKILL@. This
+      -- might be a good way to indicate the nature of the failure. This is 'True' by default.
+    , onErrorSignalChild :: !ControlThreadErrorSignal
+      -- ^ Send a signal to the child process. This is 'CtrlErrSIGABRT' by default.
+    , onErrorRetryTimes  :: !Int
+      -- ^ Try running the 'PipeControlInitializer' again and resume handling input. Repeat up to
+      -- @n@ times before performing actions to terminate the child process. This is 0 (zero) by
+      -- default.
+    }
 
 instance Show ControlThreadErrorConfig where
-  show = \ case
-    CtrlErrIgnore -> "#'ignore"
-    CtrlErrPrint -> "#'print"
-    CtrlErrRelaunch i -> "(relaunch " <> show i <> ")"
-    CtrlErrSIGABRT -> "(signal 'ABRT)"
-    CtrlErrSIGKILL -> "(signal 'KILL)"
-    CtrlErrClosePipe -> "#'close-pipe"
+  show cfg = let bool test sym = if test cfg then ' ' : sym else "" in
+    "(on-error" <> bool onErrorVentHandle "#:vent" <>
+    bool onErrorPrintStderr "#:print-stderr" <>
+    bool onErrorCloseHandle "#:close-handle" <>
+    ( case onErrorSignalChild cfg of
+        CtrlErrNoSignal -> ""
+        sig -> ' ' : show sig
+    ) <>
+    " #:retry " <> show (onErrorRetryTimes cfg) <>
+    ")"
 
 instance DisplayInfo ControlThreadErrorConfig where { displayInfo = displayInfoShow; }
 
@@ -363,6 +406,44 @@ data ProcessState
     , theProcOutPipe :: !PipeReceiver
     , theProcErrPipe :: !PipeReceiver
     } -- ^ Process halted with this exit code.
+
+-- | An image of a 'ProcessState' that contains no private information and can be safely
+-- deconstructed. You can obtain this information from a 'Process' using 'processStateInfo',
+data ProcessStateInfo
+  = ProcInfoPending
+    -- ^ The 'ProcessConfig' has been configured but has never been run.
+  | ProcInfoRunning
+    { theProcInfoPid :: !Exec.Pid
+    , theProcInfoStartTime :: !UTCTime
+    } -- ^ The process is running but has not halted yet.
+  | ProcInfoHalted
+    { theProcInfoExitCode :: !ExitCode
+    , theProcInfoStartTime :: !UTCTime
+    , theProcInfoEndTime :: !UTCTime
+    } -- ^ The process has halted.
+
+-- | Get the 'ProcessStateInfo' for a particular 'ProcessConfig', usually obtained from the
+processStateInfo :: ProcessConfig -> ProcessStateInfo
+processStateInfo = theProcConfigState >>> \ case
+  ProcPending -> ProcInfoPending
+  ProcRunning
+   {theProcStatePid=pid
+   ,theProcStartTime=start
+   } ->
+    ProcInfoRunning
+    { theProcInfoPid = pid
+    , theProcInfoStartTime = start
+    }
+  ProcHalted
+   {theProcStateExitCode=exitCode
+   ,theProcStartTime=start
+   ,theProcEndTime=end
+   } ->
+    ProcInfoHalted
+    { theProcInfoExitCode = exitCode
+    , theProcInfoStartTime = start
+    , theProcInfoEndTime = end
+    }
 
 -- | This data structure represents a portion of a process log. It is returned by 'processGetSTDOUT'
 -- and 'processGetSTDERR'. Values of this type are only for reporting, so there is a 'ToJSON'
@@ -430,7 +511,6 @@ instance Show ProcessState where
 
 instance DisplayInfo ProcessConfig where { displayInfo = displayInfoShow; }
 
-
 instance DisplayInfo Process where
   displayInfo putStr (Process mvar) = readMVar mvar >>= displayInfo putStr
 
@@ -460,6 +540,56 @@ instance DisplayInfo ProcessLog where
 
 procConfigState :: Lens' ProcessConfig ProcessState
 procConfigState = lens theProcConfigState $ \ a b -> a{ theProcConfigState = b }
+
+-- | This function performs some clean-up action if a Haskell exception is thrown in the thread that
+-- is handling one of the child process streams (the child's 'stdout' or 'stderr' stream).
+evalControlThreadErrorConfig
+  :: ControlThreadErrorConfig
+  -> ProcessState
+  -> Handle
+  -> (Int -> IO (Either EditTextError ()))
+  -> Int
+  -> SomeException
+  -> IO (Either EditTextError ())
+evalControlThreadErrorConfig cfg procSt procHandle loop i err =
+  if i >= onErrorRetryTimes cfg then abort else
+  hIsClosed procHandle >>= \ isClosed ->
+  if isClosed then return errMessage else
+  ( ifEnabled onErrorPrintStderr $ do
+      hPrint stderr err
+      hPutStrLn stderr $ "retry " <> show i <> ('/' : show (onErrorRetryTimes cfg))
+  ) >>
+  (loop $! i + 1)
+  where 
+  errMessage = Left $ EditTextFailed $ Strict.pack $ show procSt <> (' ' : show err)
+  ifEnabled test action = if test cfg then action else pure ()
+  abort = do
+    ifEnabled onErrorPrintStderr $
+      hPrint stderr $ show procSt <> (' ' : show err)
+    ifEnabled onErrorCloseHandle $
+      hIsClosed procHandle >>= \ isClosed ->
+      if isClosed then pure () else hClose procHandle
+    case procSt of
+      ProcRunning{ theProcStatePid=pid } ->
+        case onErrorSignalChild cfg of
+          CtrlErrNoSignal -> pure ()
+          CtrlErrSIGABRT  -> POSIX.signalProcess sigABRT pid
+          CtrlErrSIGKILL  -> POSIX.signalProcess sigKILL pid
+      _ -> pure ()
+    ifEnabled onErrorVentHandle $
+      const () <$> hGetContents procHandle
+    pure errMessage
+
+-- | This is the default 'ControlThreadErrorConfig'.
+controlThreadErrorConfig :: ControlThreadErrorConfig
+controlThreadErrorConfig =
+  ControlThreadErrorConfig
+  { onErrorVentHandle = False
+  , onErrorPrintStderr = True
+  , onErrorCloseHandle = True
+  , onErrorSignalChild = CtrlErrSIGABRT
+  , onErrorRetryTimes = 0
+  }
 
 -- | Not for export. This function is used to translate a 'PipeSenderConfig' into a 'Exec.StdStream'
 -- for initializing a 'Exec.CreateProcess' data structure.
@@ -518,18 +648,20 @@ pipeFoldMapLines
   -> (HaltEditStream fold tags -> LineBreakSymbol -> EditStream fold tags ())
   -> PipeControlInitializer
 pipeFoldMapLines read write bufsiz foldref useLine =
-  newEditLineState bufsiz >>= pure . readStream
-  where
-  readStream buf pipeHandle =
-    fmap (const ()) . fst <$>
-    streamEditor
-    ( read foldref >>=
-      newEditStreamState >>=
-      hFoldLines pipeHandle useLine >>= \ (result, readst) ->
-      write foldref (readst ^. editStreamState) >>
-      pure result
-    )
-    buf
+  pure $ \ pipeHandle ->
+  fmap fst $
+  newEditLineState bufsiz >>=
+  streamEditorStack
+  (const $ pure ()) -- discard all lines emitted
+  ( read foldref >>=
+    newEditStreamState >>=
+    fmap fst . hFoldLines pipeHandle
+    (\ halt lbrk ->
+      useLine halt lbrk >>
+      get >>= liftEditLine . write foldref
+    ) >>=
+    (throwError ||| pure)
+  )
 
 -- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
 -- process, and break the byte stream up into 'TextLine's. Each 'TextLine' received is passed to the
@@ -610,7 +742,7 @@ pipeMapBufferLines =
 -- __WARNING__: if evaluating this function on a 'Buffer', this will lock the buffer until the
 -- entire buffer is full, so it will not be accessible until after the process completes
 -- execution. This is slightly faster, but it can hang your program for a while if you attempt to
--- access the given 'Buffer' while the chile process is running.
+-- access the given 'Buffer' while the child process is running.
 pipeFoldBufferLines
   :: IORef fold
   -> Table.Row Buffer
@@ -657,7 +789,17 @@ pipeReceiver procHandle cfg pipeControl =
         -- STDERR. An mvar is created to use as a lock, which is unlocked when the process finishes.
         f <- initHandler
         waitMVar <- newEmptyMVar
-        thid <- forkIO $ f procHandle >>= putMVar waitMVar -- brackets here?
+        thid <- forkIO $
+          ( let loop =
+                  catch (f procHandle) .
+                  evalControlThreadErrorConfig
+                  onErr
+                  (theProcConfigState cfg)
+                  procHandle
+                  loop
+            in  loop 0
+          ) >>=
+          putMVar waitMVar
         pure (thid, waitMVar)
       makeConnectBuffer onErr readLoop row procHandle =
         -- Launch a thread and capture the process STDOUT or STDERR in a buffer
@@ -835,7 +977,7 @@ runProcess0 (Process mvar) = do
 -- entry will be reused so that it will have the same row ID and label as before. If the 'Process'
 -- is currently running, this function returns a 'Left' error message.
 runProcess :: Table.Row Process -> Manager (Either Strict.Text Exec.ProcessHandle)
-runProcess = runProcess0 . Table.theRowObject
+runProcess = runProcess0 . Table.theRowValue
 
 -- | Create, but do not execute, a new child process specification according to a
 -- 'ProcessConfig'. The 'ProcessConfig' can be created with 'asynchronous', 'asyncCapture',
@@ -901,32 +1043,44 @@ asyncCaptureNewBuffer onErr cmd args = do
   buf <- newBuffer (Strict.unwords $ "ASYNC:" : (showAsText <$> (cmd : args)))
   pure (buf, asyncCapture onErr cmd args buf)
 
--- | Setup a new asynchronous child 'Process' which will use the Haskell "Data.Text.IO" functions to
--- break a pipe into lines and evaluate
+-- | Setup a new asynchronous child 'Process' which will use 'pipeFoldBufferLines' to evaluate an
+-- 'EditStream' function.
 asyncLineFilter
   :: ControlThreadErrorConfig
   -> ProcessProgramFile
   -> [Strict.Text]
   -> MVar fold
-  -> (Strict.Text -> StateT fold IO ())
+  -> (TextLine TextTags -> StateT fold IO ())
   -> ProcessConfig
 asyncLineFilter onErr cmd args mvar filter =
   (asynchronous onErr cmd args)
   { theProcConfigOutPipe =
     PipeReceiverConfigFunction
     (Strict.unwords $ "FILTER:" : (showAsText <$> (cmd:args)))
-    CtrlErrSIGKILL
+    onErr
     ( pure $ \ pipeHandle ->
-      Strict.hGetLine pipeHandle >>=
-      fmap Right . modifyMVar_ mvar . execStateT . filter
+      fmap fst $
+      readMVar mvar >>= \ fold ->
+      newEditLineState Nothing >>=
+      streamEditorStack
+      (liftIO . (modifyMVar_ mvar . execStateT . filter))
+      ( newEditStreamState fold >>=
+        fmap fst .
+        hFoldLines pipeHandle
+        (const $ copyBufferClear >=> pushLine Before) >>=
+        (throwError ||| pure)
+      )
     )
   }
 
--- | Get the 'ProcessState' for a 'Process'.
-processGetState :: MonadIO io => Table.Row Process -> io ProcessState
-processGetState row = liftIO $
-  let (Process mvar) = Table.theRowObject row in
-  theProcConfigState <$> readMVar mvar
+-- | Get the 'ProcessConfig' for a 'Process', use 'theProcConfigState' to get the 'ProcessState' for
+-- the returned 'ProcessConfig'. You can call 'processStateInfo' on the returned 'ProcessConfig' to
+-- obtain the 'ProcessStateInfo' status of the process: whether it has started running, whether it
+-- is running, or whether it has halted.
+processGetConfig :: MonadIO io => Table.Row Process -> io ProcessConfig
+processGetConfig row = liftIO $
+  let (Process mvar) = Table.theRowValue row in
+  readMVar mvar
 
 -- | Not for export. Operate on a process only if 'theProcConfigState' is 'ProcRunning', throw an
 -- error otherwise.
@@ -936,10 +1090,21 @@ processRequireRunning
   -> (ProcessState -> IO (Either Strict.Text a))
   -> io (Either Strict.Text a)
 processRequireRunning row f = liftIO $
-  let (Process mvar) = Table.theRowObject row in
+  let (Process mvar) = Table.theRowValue row in
   withMVar mvar $ \ cfg -> case theProcConfigState cfg of
     st@(ProcRunning{}) -> f st
     _ -> pure $ Left $ Strict.pack $ show (Table.theRowLabel row) <> " process not running"
+
+-- | A stateful predicate that checks if a 'Process' is running or halted, returning 'True' if the
+-- process is still running. Of course, a process may stop running the very moment after this
+-- function returns 'True', and likewise a halted process may be re-launched by 'runProcess' the
+-- very moment after this function returns 'False', so it is not entirely reliable in a system with
+-- many activities beyond your control making changes to your process table. However, this function
+-- can be useful from within an REPL, so it is provided.
+processIsRunning :: MonadIO io => Table.Row Process -> io Bool
+processIsRunning row =
+  processRequireRunning row (const $ pure $ Right ()) >>=
+  pure . (\ case { Left{} -> False; Right () -> True; })
 
 -- | If the 'Process' was created with the 'std_in' field of the 'CreateProcess' spec set to
 -- 'CreatePipe', a 'Handle' is available for sending input to the Process (unless the 'Process' has
@@ -966,8 +1131,13 @@ processCancel row = processRequireRunning row $ \ runningProc ->
   interruptProcessGroupOf procHandle >>
   yield >>
   (\ case
-    Nothing -> Left $ Strict.pack $ show (Table.theRowLabel row) <> " process not running"
-    Just procHandle -> Right procHandle
+    Nothing ->
+      Left $
+      Strict.pack $
+      show (Table.theRowLabel row) <>
+      " process not running"
+    Just procHandle ->
+      Right procHandle
   ) <$>
   getProcessExitCode procHandle
 
@@ -976,6 +1146,33 @@ processCancel row = processRequireRunning row $ \ runningProc ->
 -- has not started yet.
 processWait :: MonadIO io => Table.Row Process -> io (Either Strict.Text ExitCode)
 processWait row = processRequireRunning row $ fmap Right . waitForProcess . theProcStateProcHandle
+
+-- | Remove a 'Job.Process' from the process table, but only if the process is not running. You must
+-- evaluate 'processCancel' first if you want to forcibly halt the process. Usually a process
+-- remains in the table after it halts so that you can gather it's output, and also gives you the
+-- chance to re-run the process with the same arguments as before by using 'runProcess'.
+processRemove :: Table.Row Process -> Manager Bool
+processRemove row =
+  editManagerEnvTable processTable $
+  (\ case
+    Table.Removed1{} -> True
+    _ -> False
+  ) <$>
+  Table.update1
+  (Table.byRowSelf row)
+  ( fmap
+    (\ running -> if running then Table.Keep else Table.Remove) .
+    processIsRunning
+  )
+
+-- | Similar to 'processRemove', but removes all 'Job.Process's that are not running. from the
+-- process table. Returns the number of elements removed from the table.
+processRemoveAll :: Manager Int
+processRemoveAll =
+  editManagerEnvTable processTable $
+  Table.remove $
+  fmap not .
+  processIsRunning
 
 -- | Find a process by it's integer ID. When a 'Process' is created by 'newProcess', 'synchronous',
 -- 'asynchronous', or any other such function, a reference to the process is stored in the current
@@ -1008,7 +1205,7 @@ processGetCaptureBuffer
   -> io (Either Strict.Text a)
 processGetCaptureBuffer row which f = liftIO $
   let err msg = pure $ Left $ "process " <> Strict.pack (show $ Table.theRowLabel row) <> msg in
-  let (Process mvar) = Table.theRowObject row in
+  let (Process mvar) = Table.theRowValue row in
   withMVar mvar $ \ cfg -> case evalGetProcessBuffer which $ theProcConfigState cfg of
     Nothing -> err " not running"
     Just pipe ->
@@ -1215,13 +1412,23 @@ startWork label task =
     liftIO $ putMVar selfMVar row
     pure row
 
+-- | Send a signal to halt the 'Worker' thread.
+haltWorker :: Worker -> IO ()
+haltWorker = flip throwTo UserInterrupt  . theWorkerId
+
 -- | not for export
 --
--- Remove a worker from the 'globalBufferTable'
+-- Remove a worker from the 'globalBufferTable' regardless of it's current state (running or not).
 clearWorker :: Table.Row Worker -> Manager Bool
-clearWorker worker =
-  editManagerEnvTable workerTable $
-  Table.remove1 (Table.byRowValue (== (worker ^. Table.rowValue)))
+clearWorker =
+  editManagerEnvTable workerTable .
+  fmap
+  (\ case
+    Table.Removed1{} -> True
+    _ -> False
+  ) .
+  Table.remove1 .
+  Table.byRowSelf
 
 -- | Create a new data 'Buffer'. Thhis function also registers the buffer into the 'bufferTable' of
 -- the 'ManagerEnv' execution environment, which is why it returns a 'Table.Row'. This is so if you
@@ -1269,7 +1476,7 @@ withBuffer0 buffer f =
 
 -- | Manipulate a buffer if you have it's handle already.
 withBuffer :: MonadIO io => Table.Row Buffer -> EditText TextTags a -> io (Either EditTextError a)
-withBuffer = withBuffer0 . Table.theRowObject
+withBuffer = withBuffer0 . Table.theRowValue
 
 -- | Pretty-print each line of data in a 'Buffer'.
 bufferShow :: MonadIO io => Table.Row Buffer -> TextRange LineIndex -> io (Either EditTextError ())
@@ -1286,7 +1493,7 @@ bufferShow row range =
 
 -- | Change the file path to which a buffer will be written when saved.
 withBufferPath :: MonadIO io => Table.Row Buffer -> (Strict.Text -> Strict.Text) -> io ()
-withBufferPath buf f = flip withBufferState (Table.theRowObject buf) $ bufStateFilePath %= f
+withBufferPath buf f = flip withBufferState (Table.theRowValue buf) $ bufStateFilePath %= f
 
 -- | Read entire content of a 'Handle' into a 'Buffer'. The 'Label' here is for what the 'Worker'
 -- should be called.
@@ -1323,30 +1530,30 @@ bufferFile path = do
 -- are polymorphic over the search index so you can use either with the same function.
 class GlobalTableSearchIndex i where
   -- | Search for a 'BufferState' created by 'newBuffer'.
-  getBuffer :: i -> Manager (Table.Row Buffer)
+  getBuffer :: i -> Manager (Maybe (Table.Row Buffer))
   -- | Search for a 'ThreadTableElem' created by 'newThread'.
-  getWorker :: i -> Manager (Table.Row Worker)
+  getWorker :: i -> Manager (Maybe (Table.Row Worker))
 
 instance GlobalTableSearchIndex Int where
   getBuffer index =
-    hackEnvTableSelect1 bufferTable (Table.byRowId index) >>=
-    maybe (error $ "no buffer identified by index " <> show index) pure
+    hackEnvTableSelect1 bufferTable $
+    Table.byRowId index
   getWorker index =
-    hackEnvTableSelect1 workerTable (Table.byRowId index) >>=
-    maybe (error $ "no worker identified by index " <> show index) pure
+    hackEnvTableSelect1 workerTable $
+    Table.byRowId index
 
 instance GlobalTableSearchIndex (Strict.Text -> Bool) where
   getBuffer label =
-    hackEnvTableSelect1 bufferTable (Table.byRowLabel label) >>=
-    maybe (error $ "no buffer matching label predicate") pure
+    hackEnvTableSelect1 bufferTable $
+    Table.byRowLabel label
   getWorker label =
-    hackEnvTableSelect1 workerTable (Table.byRowLabel label) >>=
-    maybe (error $ "no worker matching label predicate") pure
+    hackEnvTableSelect1 workerTable $
+    Table.byRowLabel label
 
 instance GlobalTableSearchIndex Strict.Text where
   getBuffer label =
-    hackEnvTableSelect1 bufferTable (Table.byRowLabel (== label)) >>=
-    maybe (error $ "no buffer matching label " <> show label) pure
+    hackEnvTableSelect1 bufferTable $
+    Table.byRowLabel (== label)
   getWorker label =
-    hackEnvTableSelect1 workerTable (Table.byRowLabel (== label)) >>=
-    maybe (error $ "no worker matching label " <> show label) pure
+    hackEnvTableSelect1 workerTable $
+    Table.byRowLabel (== label)
