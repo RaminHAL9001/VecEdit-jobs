@@ -53,7 +53,7 @@ module VecEdit.Jobs
   ) where
 
 import VecEdit.Types
-  ( RelativeDirection(..), TextRange(..), LineIndex(..),
+  ( RelativeDirection(..), Boundary(..), LineBounds, LineIndex(..),
     LineBufferSize, CharBufferSize, EditTextError(..),
   )
 
@@ -455,7 +455,7 @@ data ProcessLog
   | ProcessTextError !EditTextError
   | ProcessLog
     { theProcessLogHandle :: !(Table.Row Process) -- ^ the 'Table.RowId' of the process
-    , theProcessLogRange :: !(TextRange LineIndex) -- ^ The range of lines retrieved
+    , theProcessLogRange :: !LineBounds -- ^ The range of lines retrieved
     , theProcessLog :: !(Vector (TextLine TextTags))
     }
 
@@ -535,7 +535,7 @@ instance DisplayInfo ProcessLog where
       putStr "Process id="
       displayInfo putStr row
       putStr "\n"
-      forM_ (zip (iterate (+ 1) (theTextRangeStart range)) (Vec.toList vec)) $ \ (i, line) ->
+      forM_ (zip (iterate (+ 1) (theBoundaryStart range)) (Vec.toList vec)) $ \ (i, line) ->
         putStr $ Strict.pack $ "  " <> ralign6 i <> ": " <> show line <> "\n"
 
 procConfigState :: Lens' ProcessConfig ProcessState
@@ -1232,7 +1232,7 @@ processGetLog row which fromLine toLine =
     Right ok -> ok
   ) $
   withBuffer buf $
-  TextRange <$>
+  Boundary <$>
   validateBounds fromLine <*>
   maybe maxLineIndex validateBounds toLine >>= \ range ->
   mapRangeFreeze range (const pure) >>= \ vec ->
@@ -1479,7 +1479,7 @@ withBuffer :: MonadIO io => Table.Row Buffer -> EditText TextTags a -> io (Eithe
 withBuffer = withBuffer0 . Table.theRowValue
 
 -- | Pretty-print each line of data in a 'Buffer'.
-bufferShow :: MonadIO io => Table.Row Buffer -> TextRange LineIndex -> io (Either EditTextError ())
+bufferShow :: MonadIO io => Table.Row Buffer -> LineBounds -> io (Either EditTextError ())
 bufferShow row range =
   withBuffer row $
   foldLinesInRange range
