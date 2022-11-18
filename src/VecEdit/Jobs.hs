@@ -64,12 +64,13 @@ import VecEdit.Text.Line
     textLineString, textLineBreakSymbol, fromStringData,
   )
 import VecEdit.Text.Line.Editor
-  ( LineEditor(..), EditLine,
+  ( LineEditor(..), EditLine, EditLineState, EditLineResult(..),
+    runEditLine, editLineLiftResult,
     newEditLineState, lineBreak, streamEditorStack, copyBufferClear,
   )
 import VecEdit.Text.Stream
-  ( EditStream, HaltEditStream,
-    newEditStreamState, editStreamState, hFoldLines,
+  ( EditStream, HaltEditStream, EditStreamState,
+    newEditStreamState, hFoldLines,
   )
 import VecEdit.Text.Editor
   ( EditText, EditTextState,
@@ -87,9 +88,9 @@ import Control.Concurrent.MVar
   )
 
 import Control.Exception
-  ( SomeException, AsyncException(UserInterrupt), catch, throwTo
+  ( SomeException(..), AsyncException(UserInterrupt), try, catch, throwTo
   )
-import Control.Lens (Lens', lens, use, (^.), (.~), (%=), (.=))
+import Control.Lens (Lens', lens, use, (.~), (%=), (.=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Except (throwError)
@@ -636,13 +637,15 @@ closePipeSender (PipeSender h) = maybe (pure ()) hClose h
 -- This function is used when you setup a 'PipeReceiverConfig' using either of the
 -- 'PipeReceiverConfigNewBuffer' or 'PipeReceiverConfigBuffer' constructors.
 pipeBufferLines :: Table.Row Buffer -> PipeControlInitializer
-pipeBufferLines row = pipeMapBufferLines row (\ _ _ -> pure ())
+pipeBufferLines row =
+  pipeMapBufferLines row  $ \ _halt ->
+  lineBreak Before
 
 -- | Used to define 'pipeFoldLines' and 'pipeMapLines' __without__ a backing 'TextBuffer'. This
 -- function evaluates 'hFoldLines' within 'foldEditLines'
 pipeFoldMapLines
-  :: (ref -> EditLine tags fold)
-  -> (ref -> fold -> EditLine tags ())
+  :: (ref -> IO fold)
+  -> (ref -> fold -> IO ())
   -> CharBufferSize
   -> ref
   -> (HaltEditStream fold tags -> LineBreakSymbol -> EditStream fold tags ())
@@ -653,12 +656,17 @@ pipeFoldMapLines read write bufsiz foldref useLine =
   newEditLineState bufsiz >>=
   streamEditorStack
   (const $ pure ()) -- discard all lines emitted
-  ( read foldref >>=
+  ( liftIO
+    ( read foldref
+    ) >>=
     newEditStreamState >>=
-    fmap fst . hFoldLines pipeHandle
+    fmap fst .
+    hFoldLines pipeHandle
     (\ halt lbrk ->
       useLine halt lbrk >>
-      get >>= liftEditLine . write foldref
+      get >>=
+      liftIO .
+      write foldref
     ) >>=
     (throwError ||| pure)
   )
@@ -695,22 +703,85 @@ pipeFoldLines = pipeFoldMapLines (liftIO . readIORef) (\ ref -> liftIO . writeIO
 
 -- | Used to define 'pipeFoldBufferLines' and 'pipeMapBufferLines'.
 pipeFoldMapBufferLines
-  :: (ref -> EditLine TextTags fold)
-  -> (ref -> fold -> EditLine TextTags ())
+  :: forall ref fold
+  .  (ref -> IO fold)
+  -> (ref -> fold -> IO ())
   -> ref
   -> Table.Row Buffer
   -> (HaltEditStream fold TextTags -> LineBreakSymbol -> EditStream fold TextTags ())
   -> PipeControlInitializer
-pipeFoldMapBufferLines read write foldref row useLine =
+pipeFoldMapBufferLines read write foldref row useLine = do
+  -- In a single-threaded program, an EditText function lifts an EditLine function which lifts an
+  -- EditStream function. However this function must use 'withBuffer' and obtain a lock on the given
+  -- 'Buffer' in order to modify it. The problem is that the 'hFoldLines' function does not return
+  -- until the entire Handle it is reading closes. This function needs to decode lines of text
+  -- (including multi-byte UTF8 characters) and insert them into the given 'Buffer' one by one
+  -- without locking that buffer until the Handle closes. So we need to evaluate the 'EditLine' and
+  -- 'EditStream' function in the current thread without locking, then lock the given Buffer only
+  -- long enough to interpret the result returned by the 'EditLine' function.
+  accum <- read foldref
+  -- First create a line editor and stream editor state for buffering input from the stream handle.
+  charBuffer <- newEditLineState Nothing
+  (edlnResult, charBuffer) <- runEditLine (newEditStreamState accum) charBuffer
+  -- Next lock the 'Buffer' only to extract the 'EditStreamState', then immediately unlock.
+  streamState <- (error . show ||| id) <$>
+    withBuffer row
+    ( liftEditLine $
+      editLineLiftResult edlnResult
+    )
+  -- Now we construct the function that evaluates the input from a 'pipeHandle' within an
+  -- 'EditStream' monad. We use the 'fix' function to construct the loop.
   pure $ \ pipeHandle ->
-  fmap join $
-  withBuffer row $
-  liftEditLine $
-  read foldref >>=
-  newEditStreamState >>=
-  hFoldLines pipeHandle useLine >>= \ (result, readst) ->
-  write foldref (readst ^. editStreamState) >>
-  pure result
+    lineDecoderLoop pipeHandle charBuffer $
+    startLineDecoder pipeHandle streamState
+  where
+  lineDecoderLoop
+    :: Handle
+    -> EditLineState TextTags
+    -> EditLine TextTags ()
+    -> IO (Either EditTextError ())
+  lineDecoderLoop pipeHandle charBuffer decodeLine =
+    runEditLine decodeLine charBuffer >>= \ (edlnResult, charBuffer) ->
+    case edlnResult of
+      EditLineOK () ->
+        -- The line decoder is supposed to run until the pipeHandle closes. But on the off chance
+        -- that looping concludes and the pipeHandle has not been closed yet, it should be closed
+        -- here. This may result in the child process being killed by the operating system with a
+        -- SIGPIPE signal (the broken pipe signal), but it is better to crash the child than to let
+        -- it sit there frozen because the parent proces never consumes any of its output.
+        hIsClosed pipeHandle >>=
+        flip unless (hClose pipeHandle) >>
+        pure (Right ())
+      EditLineFail err -> pure $ Left err
+      EditLinePush dir line next ->
+        withBuffer row
+        ( pushLine dir line
+        ) >>= \ case
+          Left err -> pure $ Left err
+          Right () -> lineDecoderLoop pipeHandle charBuffer next
+      EditLinePop dir next ->
+        withBuffer row
+        ( next <$> popLine dir
+        ) >>= \ case
+          Left err -> pure $ Left err
+          Right next -> lineDecoderLoop pipeHandle charBuffer next
+  startLineDecoder :: Handle -> EditStreamState TextTags fold -> EditLine TextTags ()
+  startLineDecoder pipeHandle =
+    -- This function creates the closure that begins decoding the byte stream. When evaluating to an
+    -- @IO@ function, part of the result is a 'EditLineResult' which contains a continuation that
+    -- can, when evaluating to IO, resume decoding the input stream. So the decoding loop actually
+    -- needs to take the next continuation as an argument, and it needs to resume looping until no
+    -- next continuation is returned.
+    hFoldLines pipeHandle
+    (\ halt lbrk ->
+      -- Evaluate the EditStream continuation function
+      useLine halt lbrk >>= \ () ->
+      -- Don't forget to update the reference containing the fold value.
+      get >>=
+      liftIO .
+      write foldref
+    ) >=> \ (result, _streamState) ->
+    (throwError ||| pure) result
 
 -- | This function sets up a loop over the pipe 'Handle' to receive the byte stream from a child
 -- process, and break the byte stream up into 'TextLine's. Each 'EditStream' function is evaluated
@@ -721,10 +792,11 @@ pipeFoldMapBufferLines read write foldref row useLine =
 -- This function is used when you setup a 'PipeReceiverConfig' using the
 -- 'PipeReceiverConfigNewBufferWithFile' constructors.
 --
--- __WARNING__: if evaluating this function on a 'Buffer', this will lock the buffer until the
--- entire buffer is full, so it will not be accessible until after the process completes
--- execution. This is slightly faster, but it can hang your program for a while if you attempt to
--- access the given 'Buffer' while the chile process is running.
+-- __WARNING__: every time a line is received, this function attempts to obtain a lock on the given
+-- 'Buffer' so that it may be able to write the line to the buffer. This constant mutex locking and
+-- unlocking can be slow, though hopefully not slower than the cost of receiving bytes over a stream
+-- handle. The reason for this is so that the 'Buffer' remains unlocked and accessible to other
+-- threads, but only when the stream handle thread is not writing a new line to the buffer.
 pipeMapBufferLines
   :: Table.Row Buffer
   -> (HaltEditStream () TextTags -> LineBreakSymbol -> EditStream () TextTags ())
@@ -739,17 +811,17 @@ pipeMapBufferLines =
 -- 'TextLine' received into the given 'Buffer'. Buffering happens after evaluating the continuation,
 -- so any edits made to the 'TextLine' can be written to the buffer.
 --
--- __WARNING__: if evaluating this function on a 'Buffer', this will lock the buffer until the
--- entire buffer is full, so it will not be accessible until after the process completes
--- execution. This is slightly faster, but it can hang your program for a while if you attempt to
--- access the given 'Buffer' while the child process is running.
+-- __WARNING__: every time a line is received, this function attempts to obtain a lock on the given
+-- 'Buffer' so that it may be able to write the line to the buffer. This constant mutex locking and
+-- unlocking can be slow, though hopefully not slower than the cost of receiving bytes over a stream
+-- handle. The reason for this is so that the 'Buffer' remains unlocked and accessible to other
+-- threads, but only when the stream handle thread is not writing a new line to the buffer.
 pipeFoldBufferLines
   :: IORef fold
   -> Table.Row Buffer
   -> (HaltEditStream fold TextTags -> LineBreakSymbol -> EditStream fold TextTags ())
   -> PipeControlInitializer
-pipeFoldBufferLines =
-  pipeFoldMapBufferLines (liftIO . readIORef) (\ ref -> liftIO . writeIORef ref)
+pipeFoldBufferLines = pipeFoldMapBufferLines readIORef writeIORef
 
 -- | Inspect a 'PipeReceiverConfig' and return an 'Exec.StdStream' value that can be used to
 -- construct a 'PipeReceiver', either with 'connectPipeReceiver' or 'connectPipeSender'. This
@@ -1463,20 +1535,41 @@ internalNewBuffer label lineBufSiz charBufSiz =
 withBufferState :: MonadIO io => StateT BufferState IO a -> Buffer -> io a
 withBufferState f (Buffer mvar) =
   liftIO $
-  modifyMVar mvar $
-  fmap (\ (a, b) -> (b, a)) . runStateT f
+  modifyMVar mvar
+  ( fmap (\ (a, b) -> (b , a)) .
+    runStateT f
+  )
 
 withBuffer0 :: MonadIO io => Buffer -> EditText TextTags a -> io (Either EditTextError a)
 withBuffer0 buffer f =
   flip withBufferState buffer $ do
     ed <- use bufStateBuffer
-    (a, ed) <- liftIO $ runEditText f ed
+    (a, ed) <- liftIO $
+      try (runEditText f ed) >>= \ case
+        Left (SomeException err) ->
+          pure
+          ( Left $ EditTextFailed $ showAsText err
+          , ed
+          )
+        Right result ->
+          pure result
     bufStateBuffer .= ed
     pure a
 
 -- | Manipulate a buffer if you have it's handle already.
 withBuffer :: MonadIO io => Table.Row Buffer -> EditText TextTags a -> io (Either EditTextError a)
-withBuffer = withBuffer0 . Table.theRowValue
+withBuffer = untraced
+  where
+  untraced = withBuffer0 . Table.theRowValue -- 
+  --- traced buf edit =
+  ---   liftIO $
+  ---   myThreadId >>= \ thid -> --DEBUG
+  ---   trace (show thid <> ": locking buffer " <> show (Table.theRowLabel buf)) $
+  ---   withBuffer0 (Table.theRowValue buf) edit >>= \ result ->
+  ---   trace (show thid <> ": unlocking buffer " <> show (Table.theRowLabel buf)) $
+  ---   case result of
+  ---     Left err -> trace (show thid <> ": withBuffer -> " <> show err) $ pure $ Left err
+  ---     result -> pure result
 
 -- | Pretty-print each line of data in a 'Buffer'.
 bufferShow :: MonadIO io => Table.Row Buffer -> LineBounds -> io (Either EditTextError ())
