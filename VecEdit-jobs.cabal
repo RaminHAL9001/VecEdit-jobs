@@ -66,15 +66,13 @@ library
   exposed-modules:
     VecEdit.Jobs
 
-test-suite VecEdit-jobs-ghci
+test-suite VecEdit-jobs-tests
   import: config-VecEdit, depends-VecEdit
   type: exitcode-stdio-1.0
-  hs-source-dirs: src, test
-  main-is: Main.hs
-  other-modules:
-    VecEdit.Jobs
-    VecEdit.GHCI
+  hs-source-dirs: src, tests
+  main-is: JobsTest.hs
   build-depends:
       VecEdit
     , VecEdit-text
-    , VecEdit-jobs
+    , containers
+    , parsers

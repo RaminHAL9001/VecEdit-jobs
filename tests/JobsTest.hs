@@ -2,7 +2,7 @@ module Main where
 
 import qualified VecEdit.Jobs as Manager
 import VecEdit.Types
-  ( RelativeDirection(..), Range(..), TextRange(..),
+  ( RelativeDirection(..), Range(..), Boundary(..),
     EditTextError(..), ppGapBufferErrorInfo,
   )
 
@@ -15,16 +15,22 @@ import VecEdit.Vector.Editor.GapBuffer
   ( newGapBufferState, evalGapBuffer, gapBuffer3SliceInRange,
   )
 import qualified VecEdit.Vector.Editor.GapBuffer as GapBuf
-import VecEdit.Text.String
-  ( streamByteString,
-    LineEditor(pushLine, copyBuffer), copyBufferClear, liftEditLine, newEditStreamState,
-    insertString, streamFoldLines, editLineTokenizer, onEditLineState,
-    StringData, CharVector, toStringData, convertString,
-    toCharStream,
-    UTF8Decoder(..), utf8Decoder, utf8DecoderPushByte,
+import VecEdit.Text.Line
+  ( StringData, CharVector, toStringData, convertString,
+    toCharStream, charStreamEnd,
+  )
+import VecEdit.Text.Line.Editor
+  ( LineEditor(pushLine, copyBuffer), copyBufferClear, liftEditLine,
+    insertString, editLineTokenizer, onEditLineState,
+  )
+import VecEdit.Text.Stream
+  ( newEditStreamState, streamByteString, streamFoldLines,
+  )
+import VecEdit.Text.UTF8
+  ( UTF8Decoder(..), utf8Decoder, utf8DecoderPushByte,
   )
 import VecEdit.Text.Editor
-  ( lineNumber, maxLineIndex, cursorToEnd, loadStreamEditText,
+  ( lineNumber, cursorToEnd, loadStreamEditText,
     foldLinesFromCursor, debugViewTextEditor,
   )
 import VecEdit.Jobs
@@ -32,8 +38,8 @@ import VecEdit.Jobs
   )
 import qualified VecEdit.Table as Table
 
-import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoPrint, displayInfoShow)
-import VecEdit.Text.LineBreak (allLineBreaks, allLineBreaks, lineBreak_LF)
+import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoPrint, displayInfoShow, ralign6)
+import VecEdit.Text.Line.Break (allLineBreaks, allLineBreaks, lineBreak_LF)
 import VecEdit.Text.Parser
        ( StringParser, StringParserState(..), StringParserResult(ParseOK, ParseWait),
          runStringParser, stringParserState, feedStringParser,
@@ -41,29 +47,33 @@ import VecEdit.Text.Parser
 import VecEdit.Text.TokenizerTable (tokTableFold)
 
 import Control.Applicative ((<|>), some)
-import Control.Lens (use, (.=), (+=))
+import Control.Exception (catch, IOException)
+import Control.Lens (use, (.~), (.=), (+=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.State.Class (MonadState(..), modify)
 import Control.Monad.State (StateT, State, runState, evalStateT)
 
 import Data.Bits (Bits(bitSizeMaybe,testBit))
-import Data.Char (chr, ord, isAscii, isPrint)
+import Data.Char (chr, ord, isAscii, isPrint, isLower, toLower, toUpper)
 import qualified Data.ByteString.UTF8 as UTF8
 import qualified Data.ByteString as Bytes
 import Data.Char (isSpace, isDigit)
+import qualified Data.Set as Set
+import qualified Data.Text as Strict
+import qualified Data.Text.IO as Strict
 import qualified Data.Vector as Vec
 import Data.Vector (Vector)
 import Data.Vector.Mutable (MVector, IOVector)
-import qualified Data.Text as Strict
-import qualified Data.Text.IO as Strict
 import qualified Data.Vector.Mutable as MVec
 import Data.Word (Word32)
 
 import Text.Parser.Char (satisfy, char, spaces, oneOf, anyChar)
 import Text.Parser.Combinators (many, manyTill, choice, (<?>))
 
-import System.IO (IOMode(ReadMode), openFile, hClose)
+import System.IO (Handle, IOMode(ReadMode), openFile, hClose)
+
+--import Debug.Trace (trace, traceM)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -101,10 +111,15 @@ testEditor = do
   -- test "sweepIOBuffer"
   edst <- Vector.newEditorState :: IO (Vector.EditorState MVector Strict.Text)
   flip Vector.evalEditor edst $ do
-    let clean = do
-          Vector.filterBuffer (pure . not . Strict.null) (\ () _ _ _ -> pure ()) () >>=
-            Vector.withSubRange (Vector.fillWith "") . fst
-          liftIO $ Strict.putStrLn "buffer cleaned"
+    let clean =
+          Vector.updateBuffer
+          (\ _i line () ->
+            pure $ flip (,) () $
+            if Strict.null line then Vector.ItemRemove else Vector.ItemKeep
+          )
+          () >>=
+          Vector.withSubRange (Vector.fillWith "") . fst >>
+          liftIO (Strict.putStrLn "buffer cleaned")
     Vector.newCurrentBuffer 1
     Vector.putCurrentElem "zero"
     liftIO $ Strict.putStrLn "created buffer of 1 element"
@@ -249,7 +264,7 @@ testTextEditor = do
   liftIO $ putStrLn "\"test editor\" bufferShow ..."
   case result of
     Right line ->
-      Manager.bufferShow buf (TextRange 1 line) >>= \ case
+      Manager.bufferShow buf (Boundary 1 line) >>= \ case
         Right () -> return buf
         Left err -> error (show err)
     Left  err  -> error (show err)
@@ -426,24 +441,37 @@ testByteStreamToLines = do
   liftIO $ putStrLn ""
   --
 
+catchIOException :: IO a -> (IOException -> IO a) -> IO a
+catchIOException = catch
+
+tryOpenFile :: FilePath -> IO (FilePath, Handle) -> IO (FilePath, Handle)
+tryOpenFile path tryNext =
+  ((,) path <$> openFile path ReadMode)
+  `catchIOException`
+  const tryNext
+
 -- | This is a test function.
 bufferCabalFile :: Manager (Table.Row Buffer)
 bufferCabalFile = do
-  let filepath =  "./emacs-hacker.cabal" :: String
-  buf <- newBuffer (Strict.pack filepath)
+  let filepath1 = "./VecEdit-jobs/VecEdit-jobs.cabal" :: String
+  let filepath2 = "./VecEdit-jobs.cabal" :: String
+  let filepath3 = "./README.md" :: String
+  let showLinesNumbered _halt i line = do
+        liftIO $ putStrLn $ show i <> ": " <> show (fmap (const ()) line)
+        pure Nothing
+  buf <- newBuffer "test load file from handle"
   result <- withBuffer buf $ do
-    h <- liftIO (openFile filepath ReadMode)
-    liftIO $ putStrLn $ "loaded file " <> show filepath
+    (path, h) <- liftIO $
+      tryOpenFile filepath1 $
+      tryOpenFile filepath2 $
+      tryOpenFile filepath3 $
+      fail $ "Could not find any of the files: " <>
+      show filepath1 <> ", " <>
+      show filepath2 <> ", or " <>
+      show filepath3
+    liftIO $ putStrLn $ "loaded file " <> show path
     loadStreamEditText h
     liftIO $ hClose h
-    let showLinesNumbered _halt i line = do
-          liftIO $ putStrLn $ show i <> ": " <> show (fmap (const ()) line)
-          pure Nothing
-    linum <- lineNumber
-    count <- maxLineIndex
-    liftIO $ putStrLn $
-      "loaded file stream: lines = " <> show count <>
-      ", cursor = " <> show linum <> "\ncursorToEnd Before ...."
     cursorToEnd Before
     linum <- lineNumber
     liftIO $ putStrLn $
@@ -572,7 +600,7 @@ newParse :: String -> StringParserState
 newParse str =
   stringParserState
   { theParserIsEOF = False
-  , theParserStream = toCharStream 0 str
+  , theParserStream = toCharStream str charStreamEnd
   }
 
 chvec :: String -> CharVector
@@ -592,6 +620,220 @@ testStringParser = do
         ]
   if a == expect then pure () else
     error $ "expected: " <> show expect <> "\nparsed: " <> show a
+
+----------------------------------------------------------------------------------------------------
+
+preambleAGPL :: Vector (Strict.Text, Strict.Text)
+preambleAGPL =
+  Vec.fromList $
+  [ ("AA", "    The GNU Affero General Public  License is a free, copyleft license")
+  , ("AB", "for software and other kinds of works, specifically designed to ensure")
+  , ("AC", "cooperation with the community in the case of network server software.")
+  , ("AD", "    The  licenses for  most  software and  other  practical works  are")
+  , ("AE", "designed to take away your freedom  to share and change the works.  By")
+  , ("AF", "contrast, our General  Public Licenses are intended  to guarantee your")
+  , ("AG", "freedom to share and change all versions of a program--to make sure it")
+  , ("AH", "remains free software for all its users."                              )
+  , ("AI", "    When we speak  of free software, we are referring  to freedom, not")
+  , ("AJ", "price.  Our General Public Licenses are designed to make sure that you")
+  , ("AK", "have the freedom to distribute copies of free software (and charge for")
+  , ("AL", "them if you wish),  that you receive source code or can  get it if you")
+  , ("AM", "want it, that you  can change the software or use pieces  of it in new")
+  , ("AN", "free programs, and that you know you can do these things."             )
+  , ("AO", "    Developers  that  use our  General  Public  Licenses protect  your")
+  , ("AP", "rights with two  steps: (1) assert copyright on the  software, and (2)")
+  , ("AQ", "offer  you this  License which  gives  you legal  permission to  copy,")
+  , ("AR", "distribute and/or modify the software."                                )
+  , ("AS", "    A  secondary  benefit of  defending  all  users' freedom  is  that")
+  , ("AT", "improvements  made  in alternate  versions  of  the program,  if  they")
+  , ("AU", "receive  widespread  use, become  available  for  other developers  to")
+  , ("AV", "incorporate.   Many  developers of  free  software  are heartened  and")
+  , ("AW", "encouraged  by the  resulting cooperation.   However, in  the case  of")
+  , ("AX", "software used on network servers, this  result may fail to come about.")
+  , ("AY", "The GNU General  Public License permits making a  modified version and")
+  , ("AZ", "letting the  public access it on  a server without ever  releasing its")
+  , ("BA", "source code to the public."                                            )
+  , ("BB", "    The GNU Affero General Public  License is designed specifically to")
+  , ("BC", "ensure that, in such cases, the modified source code becomes available")
+  , ("BD", "to the  community.  It requires  the operator  of a network  server to")
+  , ("BE", "provide the source  code of the modified version running  there to the")
+  , ("BF", "users of that server.  Therefore, public use of a modified version, on")
+  , ("BG", "a publicly  accessible server, gives  the public access to  the source")
+  , ("BH", "code of the modified version."                                         )
+  , ("BI", "    An older  license, called  the Affero  General Public  License and")
+  , ("BJ", "published by Affero,  was designed to accomplish  similar goals.  This")
+  , ("BK", "is a  different license, not a  version of the Affero  GPL, but Affero")
+  , ("BL", "has released a new version of the Affero GPL which permits relicensing")
+  , ("BM", "under this license."                                                   )
+  ]
+
+-- | Selecting only lines that contain the words "software", "license", or "GNU".
+preambleAGPLFound :: Vector (Strict.Text, Strict.Text)
+preambleAGPLFound =
+  Vec.fromList
+  [ ("AA", "    The GNU Affero General Public  License is a free, copyleft license")
+  , ("AB", "for software and other kinds of works, specifically designed to ensure")
+  , ("AC", "cooperation with the community in the case of network server software.")
+  , ("AD", "    The  licenses for  most  software and  other  practical works  are")
+  , ("AF", "contrast, our General  Public Licenses are intended  to guarantee your")
+  , ("AH", "remains free software for all its users."                              )
+  , ("AI", "    When we speak  of free software, we are referring  to freedom, not")
+  , ("AJ", "price.  Our General Public Licenses are designed to make sure that you")
+  , ("AK", "have the freedom to distribute copies of free software (and charge for")
+  , ("AM", "want it, that you  can change the software or use pieces  of it in new")
+  , ("AO", "    Developers  that  use our  General  Public  Licenses protect  your")
+  , ("AP", "rights with two  steps: (1) assert copyright on the  software, and (2)")
+  , ("AQ", "offer  you this  License which  gives  you legal  permission to  copy,")
+  , ("AR", "distribute and/or modify the software."                                )
+  , ("AV", "incorporate.   Many  developers of  free  software  are heartened  and")
+  , ("AX", "software used on network servers, this  result may fail to come about.")
+  , ("AY", "The GNU General  Public License permits making a  modified version and")
+  , ("BB", "    The GNU Affero General Public  License is designed specifically to")
+  , ("BI", "    An older  license, called  the Affero  General Public  License and")
+  , ("BK", "is a  different license, not a  version of the Affero  GPL, but Affero")
+  , ("BM", "under this license."                                                   )
+  ]
+
+-- | Removing any lines of text that contain the words "software", "license", or "GNU".
+preambleAGPLNotFound :: Vector (Strict.Text, Strict.Text)
+preambleAGPLNotFound =
+  Vec.fromList
+  [ ("AE", "designed to take away your freedom  to share and change the works.  By")
+  , ("AG", "freedom to share and change all versions of a program--to make sure it")
+  , ("AL", "them if you wish),  that you receive source code or can  get it if you")
+  , ("AN", "free programs, and that you know you can do these things."             )
+  , ("AS", "    A  secondary  benefit of  defending  all  users' freedom  is  that")
+  , ("AT", "improvements  made  in alternate  versions  of  the program,  if  they")
+  , ("AU", "receive  widespread  use, become  available  for  other developers  to")
+  , ("AW", "encouraged  by the  resulting cooperation.   However, in  the case  of")
+  , ("AZ", "letting the  public access it on  a server without ever  releasing its")
+  , ("BA", "source code to the public."                                            )
+  , ("BC", "ensure that, in such cases, the modified source code becomes available")
+  , ("BD", "to the  community.  It requires  the operator  of a network  server to")
+  , ("BE", "provide the source  code of the modified version running  there to the")
+  , ("BF", "users of that server.  Therefore, public use of a modified version, on")
+  , ("BG", "a publicly  accessible server, gives  the public access to  the source")
+  , ("BH", "code of the modified version."                                         )
+  , ("BJ", "published by Affero,  was designed to accomplish  similar goals.  This")
+  , ("BL", "has released a new version of the Affero GPL which permits relicensing")
+  ]
+
+-- | All-caps lines that contain the string "free"
+preambleAGPLLoudFree :: Vector (Strict.Text, Strict.Text)
+preambleAGPLLoudFree =
+  Vec.fromList
+  [ ("AE", "DESIGNED TO TAKE AWAY YOUR FREEDOM  TO SHARE AND CHANGE THE WORKS.  BY")
+  , ("AG", "FREEDOM TO SHARE AND CHANGE ALL VERSIONS OF A PROGRAM--TO MAKE SURE IT")
+  , ("AL", "them if you wish),  that you receive source code or can  get it if you")
+  , ("AN", "FREE PROGRAMS, AND THAT YOU KNOW YOU CAN DO THESE THINGS."             )
+  , ("AS", "    A  SECONDARY  BENEFIT OF  DEFENDING  ALL  USERS' FREEDOM  IS  THAT")
+  , ("AT", "improvements  made  in alternate  versions  of  the program,  if  they")
+  , ("AU", "receive  widespread  use, become  available  for  other developers  to")
+  , ("AW", "encouraged  by the  resulting cooperation.   However, in  the case  of")
+  , ("AZ", "letting the  public access it on  a server without ever  releasing its")
+  , ("BA", "source code to the public."                                            )
+  , ("BC", "ensure that, in such cases, the modified source code becomes available")
+  , ("BD", "to the  community.  It requires  the operator  of a network  server to")
+  , ("BE", "provide the source  code of the modified version running  there to the")
+  , ("BF", "users of that server.  Therefore, public use of a modified version, on")
+  , ("BG", "a publicly  accessible server, gives  the public access to  the source")
+  , ("BH", "code of the modified version."                                         )
+  , ("BJ", "published by Affero,  was designed to accomplish  similar goals.  This")
+  , ("BL", "has released a new version of the Affero GPL which permits relicensing")
+  ]
+
+pairRowLabelValue :: Table.Row a -> (Strict.Text, a)
+pairRowLabelValue row = (Table.theRowLabel row, Table.theRowValue row)
+
+textContainsAnyOf :: Strict.Text -> Strict.Text -> Bool
+textContainsAnyOf syms0 input0 =
+  or $ flip elem syms <$> input
+  where
+  lwords =
+    Strict.words .
+    Strict.filter
+    (\ c -> isLower c || isSpace c) .
+    Strict.map toLower
+  syms  = Vec.fromList $ lwords syms0
+  input = lwords input0
+
+setEqVectors :: Ord a => Vector a -> Vector a -> Bool
+setEqVectors a b = set a == set b
+  where
+  set = Set.fromList . Vec.toList
+
+showTestVec :: Vector (Strict.Text, Strict.Text) -> IO ()
+showTestVec vec =
+  forM_ (zip [0::Int ..] $ Vec.toList vec) $ \ (i, (lbl, txt)) ->
+  putStrLn $ ralign6 i <> ": " <> Strict.unpack lbl <> ": " <> show txt
+
+tableTests :: IO ()
+tableTests = do
+  table <- Table.new 4
+  let testFilter = textContainsAnyOf "GNU software licenses license"
+  ((), table) <-
+    flip Table.exec table $
+    mapM_ (uncurry Table.insert) $
+    Vec.toList preambleAGPL
+  (found, table) <-
+    flip Table.exec table $
+    fmap (fmap pairRowLabelValue) $
+    Table.list $
+    pure . testFilter . Table.theRowValue
+  if setEqVectors found preambleAGPLFound
+    then
+      putStrLn "TEST PASSED: Table.insert, Table.list"
+    else do
+      putStrLn $ "'Table.list'\nexpected result (order not important):"
+      showTestVec preambleAGPLFound
+      putStrLn $ "computed result (order not important):"
+      showTestVec found
+      putStrLn "FAILED TEST"
+  (found, table) <-
+    flip Table.exec table $
+    fmap pairRowLabelValue <$>
+    Table.select1
+    (textContainsAnyOf "goals" . Table.theRowValue)
+  let expected = preambleAGPL Vec.! 35
+  case found of
+    Just pair | pair == expected ->
+      putStrLn "TEST PASSED: Table.select1"
+    found ->
+      putStrLn $
+      "expected result:\nJust " <> show expected <>
+      "\nactual result: " <> show found <>
+      "\nTEST FAILED: Table.select1"
+  let expected =
+        ( Table.UpdateResult
+          { Table.manyKept    = 14
+          , Table.manyRemoved = 21
+          , Table.manyUpdated = 4
+          }
+        , preambleAGPLLoudFree
+        )
+  (result, _table) <-
+    flip Table.exec table $
+    (,) <$>
+    Table.update
+    (\ row -> pure $
+      let txt = Table.theRowValue row in
+      if testFilter txt
+      then Table.ItemRemove
+      else if textContainsAnyOf "free freedom" txt
+      then Table.ItemUpdate $ Table.rowValue .~ Strict.map toUpper txt $ row
+      else Table.ItemKeep
+    ) <*>
+    ( fmap pairRowLabelValue <$>
+      Table.list (const $ pure True)
+    )
+  if fst result == fst expected && setEqVectors (snd result) (snd expected) then
+      putStrLn "TEST PASSED: Table.update"
+    else do
+      putStrLn $ "expected value: " <> show (fst expected)
+      showTestVec (snd expected)
+      putStrLn $ "actual result: " <> show (fst result)
+      showTestVec (snd result)
+  pure ()
 
 ----------------------------------------------------------------------------------------------------
 
@@ -616,5 +858,8 @@ main = do
   --------------------------
   -- Parser tests
   testStringParser
+  --------------------------
+  -- Table tests
+  tableTests
   --------------------------
   pure ()

@@ -339,14 +339,14 @@ data ControlThreadErrorConfig
 
 instance Show ControlThreadErrorConfig where
   show cfg = let bool test sym = if test cfg then ' ' : sym else "" in
-    "(on-error" <> bool onErrorVentHandle "#:vent" <>
-    bool onErrorPrintStderr "#:print-stderr" <>
-    bool onErrorCloseHandle "#:close-handle" <>
+    "(on-error" <> bool onErrorVentHandle "#'vent" <>
+    bool onErrorPrintStderr "#'print-stderr" <>
+    bool onErrorCloseHandle "#'close-handle" <>
     ( case onErrorSignalChild cfg of
         CtrlErrNoSignal -> ""
         sig -> ' ' : show sig
     ) <>
-    " #:retry " <> show (onErrorRetryTimes cfg) <>
+    " #'retry " <> show (onErrorRetryTimes cfg) <>
     ")"
 
 instance DisplayInfo ControlThreadErrorConfig where { displayInfo = displayInfoShow; }
@@ -1233,7 +1233,7 @@ processRemove row =
   Table.update1
   (Table.byRowSelf row)
   ( fmap
-    (\ running -> if running then Table.Keep else Table.Remove) .
+    (\ running -> if running then Table.ItemKeep else Table.ItemRemove) .
     processIsRunning
   )
 
