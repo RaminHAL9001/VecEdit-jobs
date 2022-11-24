@@ -1058,7 +1058,10 @@ runProcess = runProcess0 . Table.theRowValue
 newProcess :: ProcessConfig -> Manager (Table.Row Process)
 newProcess cfg =
   editManagerEnvTable processTable $
-  liftIO (newMVar cfg) >>= Table.insert (processCreateLabel cfg) . Process
+  liftIO (newMVar cfg) >>=
+  fmap snd .
+  Table.insert (processCreateLabel cfg) .
+  Process
 
 -- | Setup a new synchronous child 'Process', which will use the same 'stdin', 'stdout', and
 -- 'stderr' stream as the current process, and blocking the current process until the child process
@@ -1480,7 +1483,7 @@ startWork label task =
           { theWorkerId = thid
           , theWorkerStatus = statMVar
           }
-    row <- Table.insert label worker
+    row <- snd <$> Table.insert label worker
     liftIO $ putMVar selfMVar row
     pure row
 
@@ -1530,6 +1533,7 @@ internalNewBuffer label lineBufSiz charBufSiz =
     , theBufStateBuffer   = ed
     }
   ) >>=
+  fmap snd .
   Table.insert label
 
 withBufferState :: MonadIO io => StateT BufferState IO a -> Buffer -> io a
