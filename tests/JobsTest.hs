@@ -38,7 +38,10 @@ import VecEdit.Jobs
   )
 import qualified VecEdit.Table as Table
 
-import VecEdit.Print.DisplayInfo (DisplayInfo(..), displayInfoPrint, displayInfoShow, ralign6)
+import VecEdit.Print.DisplayInfo
+  ( DisplayInfo(..),
+    displayInfoPrint, displayInfoShow, ralign6
+  )
 import VecEdit.Text.Line.Break (allLineBreaks, allLineBreaks, lineBreak_LF)
 import VecEdit.Text.Parser
        ( StringParser, StringParserState(..), StringParserResult(ParseOK, ParseWait),
@@ -47,8 +50,8 @@ import VecEdit.Text.Parser
 import VecEdit.Text.TokenizerTable (tokTableFold)
 
 import Control.Applicative ((<|>), some)
-import Control.Exception (catch, IOException)
-import Control.Lens (use, (.~), (.=), (+=))
+import Control.Exception (IOException, catch)
+import Control.Lens (use, (.~), (%~), (.=), (+=))
 import Control.Monad -- re-exporting
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.State.Class (MonadState(..), modify)
@@ -71,7 +74,7 @@ import Data.Word (Word32)
 import Text.Parser.Char (satisfy, char, spaces, oneOf, anyChar)
 import Text.Parser.Combinators (many, manyTill, choice, (<?>))
 
-import System.IO (Handle, IOMode(ReadMode), openFile, hClose)
+import System.IO (IOMode(ReadMode), Handle, openFile, hClose)
 
 --import Debug.Trace (trace, traceM)
 
@@ -769,6 +772,11 @@ showTestVec vec =
 
 tableTests :: IO ()
 tableTests = do
+  let showPassed = False
+  let passed =
+        if showPassed
+        then putStrLn . ("TEST PASSED: " <>)
+        else const $ pure ()
   table <- Table.new 4
   let testFilter = textContainsAnyOf "GNU software licenses license"
   ((), table) <-
@@ -782,7 +790,7 @@ tableTests = do
     pure . testFilter . Table.theRowValue
   if setEqVectors found preambleAGPLFound
     then
-      putStrLn "TEST PASSED: Table.insert, Table.list"
+      passed "Table.insert, Table.list"
     else do
       putStrLn $ "'Table.list'\nexpected result (order not important):"
       showTestVec preambleAGPLFound
@@ -797,7 +805,7 @@ tableTests = do
   let expected = preambleAGPL Vec.! 35
   case found of
     Just pair | pair == expected ->
-      putStrLn "TEST PASSED: Table.select1"
+      passed "Table.select1"
     found ->
       putStrLn $
       "expected result:\nJust " <> show expected <>
@@ -811,7 +819,7 @@ tableTests = do
           }
         , preambleAGPLLoudFree
         )
-  (result, _table) <-
+  (result, table) <-
     flip Table.exec table $
     (,) <$>
     Table.update
@@ -827,12 +835,54 @@ tableTests = do
       Table.list (const $ pure True)
     )
   if fst result == fst expected && setEqVectors (snd result) (snd expected) then
-      putStrLn "TEST PASSED: Table.update"
+      passed "Table.update"
     else do
       putStrLn $ "expected value: " <> show (fst expected)
       showTestVec (snd expected)
       putStrLn $ "actual result: " <> show (fst result)
       showTestVec (snd result)
+  (result, _table) <-
+    flip Table.exec table $
+    let findBL = ("BL" ==) . Table.theRowLabel in
+    (,) <$>
+    Table.update1 findBL
+    ( pure .
+      Table.ItemUpdate .
+      (Table.rowValue %~ Strict.map (const '-'))
+    ) <*>
+    Table.select1 findBL
+  let expected = do
+        let upd = fst result
+        let oldRow = Table.removedRow upd
+        let newRow = snd result
+        let oldPhrase =
+              "has released a new version of the Affero GPL which permits relicensing" ::
+              Strict.Text
+        let newPhrase =
+              "----------------------------------------------------------------------" ::
+              Strict.Text
+        newRow <- case newRow of
+          Nothing -> Left "Table.select1 failed to select row \"BL\" after update"
+          Just newRow -> Right newRow
+        unless (Table.updatedIndex upd == 17) $ Left $
+          "expected index: 17, result index: " <>
+          show (Table.updatedIndex upd)
+        unless (Table.theRowLabel oldRow == "BL") $ Left $
+          "expected replaced row label: \"BL\", result replaced row label: " <>
+          show (Table.theRowLabel oldRow)
+        unless (Table.theRowLabel newRow == "BL") $ Left $
+          "expected inserted row label: \"BL\", result inserted row label: " <>
+          show (Table.theRowLabel oldRow)
+        unless (Table.theRowValue oldRow == oldPhrase) $ Left $
+          "expected removed phrase: " <> show oldPhrase <>
+          "\nresult removed phrase: " <> show (Table.theRowValue oldRow)
+        unless (Table.theRowValue newRow == newPhrase) $ Left $
+          "expected inserted phrase: " <> show newPhrase <>
+          "\nresult inserted phrase: " <> show (Table.theRowValue newRow)
+        Right ()
+  case expected of
+    Left err -> putStrLn "TEST FAILED Table.update1:" >> putStrLn err
+    Right () -> passed "Table.update1"
   pure ()
 
 ----------------------------------------------------------------------------------------------------
